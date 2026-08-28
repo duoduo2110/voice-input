@@ -34,12 +34,14 @@ JUNK_WORDS = (
 
 
 class ASRCorrector:
-    """Qwen2.5-0.5B-Instruct 智能纠错单例。"""
+    """Qwen 智能纠错单例 (支持 0.5B / 1.5B 等尺寸，带优雅回退)。"""
 
     def __init__(self):
         self.env_default = os.environ.get("ENABLE_LLM_CORRECT", "true").lower() == "true"
         self.enabled = self.env_default
-        self.model_name = os.environ.get("LLM_CORRECT_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+        self.primary = os.environ.get("LLM_CORRECT_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+        self.fallback = os.environ.get("LLM_FALLBACK_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+        self.model_name = self.primary
         self.model = None          # HF CLM (cuda fp16)
         self.tokenizer = None
         self.torch = None
@@ -53,18 +55,39 @@ class ASRCorrector:
             import torch  # 延迟导入: 禁用时不占显存/内存
             from transformers import AutoModelForCausalLM, AutoTokenizer
             self.torch = torch
-            print(f"[Corrector] 加载 {self.model_name} (CUDA float16) ...", flush=True)
-            t0 = time.perf_counter()
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name, torch_dtype=torch.float16,
-                device_map="cuda", low_cpu_mem_usage=True)
-            self.model.eval()
-            print(f"[Corrector] 模型加载完成 ({time.perf_counter()-t0:.1f}s), 预热中...", flush=True)
-            self.correct("我想吃平果")          # 预热 CUDA kernel / CUDA graph
-            print("[Corrector] 预热完成, 常驻就绪", flush=True)
+
+            candidates = [self.primary]
+            if self.fallback and self.fallback != self.primary:
+                candidates.append(self.fallback)
+
+            for target in candidates:
+                try:
+                    print(f"[Corrector] 加载 {target} (CUDA float16) ...", flush=True)
+                    t0 = time.perf_counter()
+                    self.tokenizer = AutoTokenizer.from_pretrained(target, trust_remote_code=True)
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        target,
+                        torch_dtype=torch.float16,
+                        device_map="cuda",
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True
+                    )
+                    self.model.eval()
+                    self.model_name = target
+                    print(f"[Corrector] 模型 {target} 加载完成 ({time.perf_counter()-t0:.1f}s), 预热中...", flush=True)
+                    self.correct("我想吃平果")          # 预热 CUDA kernel / CUDA graph
+                    print(f"[Corrector] {target} 预热完成, 常驻就绪", flush=True)
+                    return
+                except Exception as e:
+                    print(f"[Corrector] 加载 {target} 异常: {e}", flush=True)
+                    if 'torch' in locals() and hasattr(torch.cuda, 'empty_cache'):
+                        torch.cuda.empty_cache()
+
+            print("[Corrector] 全部候选模型加载失败，引擎关闭，回退原始 ASR 文本", flush=True)
+            self.enabled = False
+            self.model = None
         except Exception as e:
-            print(f"[Corrector] 引擎不可用, 回退原始 ASR 文本: {e}", flush=True)
+            print(f"[Corrector] 引擎初始化失败: {e}", flush=True)
             self.enabled = False
             self.model = None
 
