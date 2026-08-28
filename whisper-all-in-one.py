@@ -989,7 +989,7 @@ h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135de
       <h1><span class="live"></span>🎤 语音输入</h1>
       <p class="sub">Web 麦克风 → GPU Whisper 转录 → 光标处即时上屏</p>
     </div>
-    <button id="corrToggle" type="button" title="LLM 智能纠错(Qwen2.5-0.5B)">✨ 智能纠错 开</button>
+    <button id="corrToggle" type="button" title="LLM 智能纠错(Qwen2.5-0.5B)">✨ 智能纠错 关</button>
   </header>
   <div id="banner" hidden role="alert"></div>
   <div id="status">正在检测环境…</div>
@@ -1335,8 +1335,8 @@ $("kDel2").onpointerdown  = (e) => { e.preventDefault(); keyAction("backspace2",
 $("kClear").onpointerdown = (e) => { e.preventDefault(); keyAction("clear", $("kClear"), e); };
 $("kEnter").onpointerdown = (e) => { e.preventDefault(); keyAction("enter", $("kEnter"), e); };
 
-/* ---------- LLM 智能纠错开关 (与后端 ENABLE_LLM_CORRECT 同步) ---------- */
-let llmCorrect = true;
+/* ---------- LLM 智能纠错开关 (与后端 ENABLE_LLM_CORRECT 同步，默认关=Whisper原文直出) ---------- */
+let llmCorrect = false;
 function updateCorrUI(){
   const on = !!llmCorrect;
   $("corrToggle").classList.toggle("off", !on);
@@ -1400,17 +1400,15 @@ function phoneVibrateErr(){
 }
 
 async function sendPhoneText(){
-  const text = (phoneText.value || "").trimEnd();
-  // 允许纯空格? 这里要求非空
+  const raw = (phoneText.value || "");
+  const text = raw.trimEnd();
   if (!text.trim()){ phoneTip.textContent = "请输入内容"; phoneVibrateErr(); setTimeout(()=> phoneTip.textContent="", 1400); return; }
   phoneSend.disabled = true;
   phoneTip.textContent = "发送中…";
   let ok = false, len = text.length, preview = text.slice(0,20);
-  // 优先走已建立的 WSS (毫秒级), 否则 HTTP
   let via = "";
   try{
     if (ws && ws.readyState === 1){
-      // 通过 WebSocket 直发
       const p = new Promise((resolve, reject)=>{
         const timer = setTimeout(()=> reject(new Error("ws timeout")), 2200);
         function onMsg(ev){
@@ -1432,25 +1430,55 @@ async function sendPhoneText(){
       throw new Error("no ws");
     }
   }catch(_){
-    // HTTP 直发 (POST JSON, 兼容 28768 仅 GET 的限制 -> 回退到 8766)
-    via = "HTTP";
-    const httpUrl = httpTypeFallbackUrl();
-    const httpGetUrl = (httpUrl === "/api/type") ? ("/api/type?t=" + encodeURIComponent(text)) : (httpUrl + "?t=" + encodeURIComponent(text));
+    // 同源 HTTPS GET 直发（绝对不走 http:8766，避免 Mixed Content 拦截）
+    // 28768 与页面同源同端口同证书，100% 无跨域/混合内容问题；POST 在 28768 受 websockets 握手限制，故统一 GET
+    via = "HTTPS";
+    const CHUNK = 1500; // 单片安全阈值（URL 8k 限制，中文编码膨胀 ~3 倍）
     try{
-      const r = await fetch(httpUrl, {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({text}),
-        cache: "no-store"
-      });
-      const j = await r.json();
-      ok = !!j.ok; len = j.len ?? len; preview = j.preview ?? preview;
+      if (text.length <= CHUNK){
+        const r = await fetch("/type?t=" + encodeURIComponent(text), { cache: "no-store" });
+        const j = await r.json();
+        ok = !!j.ok; len = j.len ?? len; preview = j.preview ?? preview;
+        if (!ok) throw new Error("not ok");
+      } else {
+        let sent = 0;
+        let firstPreview = preview;
+        let allOk = true;
+        for (let i=0; i<text.length; i+=CHUNK){
+          const part = text.slice(i, i+CHUNK);
+          const r = await fetch("/type?t=" + encodeURIComponent(part), { cache: "no-store" });
+          const j = await r.json();
+          if (!j.ok){ allOk = false; break; }
+          sent += j.len ?? part.length;
+          if (i===0) firstPreview = j.preview ?? firstPreview;
+          await new Promise(res=> setTimeout(res, 60));
+        }
+        ok = allOk && sent>0;
+        len = sent || len;
+        preview = firstPreview;
+      }
     }catch(e){
-      // GET 兜底 (兼容极旧 WebView / 28768 场景)
+      // 同源 /api/type 兜底（同样 HTTPS 同端口）
       try{
-        const r2 = await fetch(httpGetUrl, {cache:"no-store"});
-        const j2 = await r2.json();
-        ok = !!j2.ok; len = j2.len ?? len; preview = j2.preview ?? preview;
+        if (text.length <= CHUNK){
+          const r2 = await fetch("/api/type?t=" + encodeURIComponent(text), {cache:"no-store"});
+          const j2 = await r2.json();
+          ok = !!j2.ok; len = j2.len ?? len; preview = j2.preview ?? preview;
+        } else {
+          let sent2 = 0;
+          let firstPreview2 = preview;
+          let ok2 = true;
+          for (let i=0; i<text.length; i+=CHUNK){
+            const part = text.slice(i, i+CHUNK);
+            const r = await fetch("/api/type?t=" + encodeURIComponent(part), {cache:"no-store"});
+            const j = await r.json();
+            if (!j.ok){ ok2=false; break; }
+            sent2 += j.len ?? part.length;
+            if (i===0) firstPreview2 = j.preview ?? firstPreview2;
+            await new Promise(res=> setTimeout(res, 60));
+          }
+          ok = ok2; len = sent2 || len; preview = firstPreview2;
+        }
       }catch(_2){
         ok = false;
       }
@@ -1476,16 +1504,6 @@ phoneText.addEventListener("keydown", (e)=>{
     sendPhoneText();
   }
 });
-
-/* 28768 HTTPS POST 限制说明: websockets 仅支持 GET 握手, 该端口 POST 会被协议层拒绝;
-   故 sendPhoneText 优先走 WSS, 失败则回退到当前 origin 的 /api/type(若为 8766)或显式 8766 端口。
-   此处做一个轻量探测: 若当前 location.port 为 28768/28765, 则 HTTP 回退走显式 8766。 */
-function httpTypeFallbackUrl(){
-  const h = location.hostname || "127.0.0.1";
-  // 若已在 8766, 直接同源; 否则显式指向 8766
-  if (String(location.port) === "8766") return "/api/type";
-  return "http://" + h + ":8766/api/type";
-}
 
 /* 对外暴露小工具: 快捷键面板也可一键把输入框内容发送 */
 window.__sendPhoneText = sendPhoneText;

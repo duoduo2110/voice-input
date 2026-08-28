@@ -8,8 +8,8 @@ corrector.py — 本地轻量 LLM ASR 智能纠错引擎 (Qwen2.5-0.5B-Instruct)
   自动回退到 Whisper 原始 ASR 文本
 - 纯英文/数字短句(无同音歧义)直接跳过, 保持极低时延
 
-环境变量:
-  ENABLE_LLM_CORRECT  默认 true; 设为 false 则禁用且不加载模型
+ 环境变量:
+  ENABLE_LLM_CORRECT  默认 false; 设为 true 才启用 (以 Whisper 原文为基准，默认零改写)
   LLM_CORRECT_MODEL   默认 Qwen/Qwen2.5-0.5B-Instruct
 """
 
@@ -19,10 +19,11 @@ import threading
 import time
 
 SYSTEM_PROMPT = (
-    "ASR语音纠错，只输出纠正后的干净文本，不要解释。\n"
-    "示例：\n"
-    "输入：我想吃平果\n输出：我想吃苹果\n"
-    "输入：在次尝试\n输出：再次尝试\n"
+    "严格逐字校对ASR同音错别字。规则："
+    "1.绝对禁止概括、缩写、润色或删除口语词；"
+    "2.字数与原句必须严格一致；"
+    "3.只改同音错字，原句正确的字绝对不动；"
+    "4.直接输出全文。"
 )
 
 # 模型一出现这些词(且原文不包含)即视为“解释/废话” -> 回退
@@ -37,7 +38,7 @@ class ASRCorrector:
     """Qwen 智能纠错单例 (支持 0.5B / 1.5B 等尺寸，带优雅回退)。"""
 
     def __init__(self):
-        self.env_default = os.environ.get("ENABLE_LLM_CORRECT", "true").lower() == "true"
+        self.env_default = os.environ.get("ENABLE_LLM_CORRECT", "false").lower() == "true"
         self.enabled = self.env_default
         self.primary = os.environ.get("LLM_CORRECT_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
         self.fallback = os.environ.get("LLM_FALLBACK_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
@@ -108,8 +109,29 @@ class ASRCorrector:
         return not re.search(r"[\u4e00-\u9fff]", t)
 
     @staticmethod
+    def _levenshtein(a, b):
+        """纯 Python Levenshtein，O(n*m) 双行优化，适配 200 字内短句熔断。"""
+        if a == b:
+            return 0
+        if not a:
+            return len(b)
+        if not b:
+            return len(a)
+        # 确保 b 为较短者以节省内存
+        if len(a) < len(b):
+            a, b = b, a
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i] + [0] * len(b)
+            for j, cb in enumerate(b, 1):
+                cost = 0 if ca == cb else 1
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            prev = cur
+        return prev[len(b)]
+
+    @staticmethod
     def accept(orig, cand):
-        """纠错结果验收: 空 / 膨胀>1.4x / 废话词 / 无字符重叠 -> 回退原始文本。
+        """极严字级护栏：长度±10% / Levenshtein>15% / 废话词 / 零重叠 -> 100%回退原文。
         返回 (ok, cleaned_cand)。"""
         c = (cand or "").strip().strip("\"'“”‘’ ")
         c = re.sub(r"^(更正|纠错|改为|应该是|正确为)[:：]?\s*", "", c)
@@ -118,7 +140,14 @@ class ASRCorrector:
         o = (orig or "").strip()
         if not o:
             return False, ""
-        if len(c) > len(o) * 1.4 + 2:                       # 长度膨胀护栏
+        lo, lc = len(o), len(c)
+        # 1) 字数严格对齐硬护栏：±10% 外一律丢弃（模型擅自总结/删口语词）
+        if abs(lc - lo) > lo * 0.10 + 1e-9:
+            return False, c
+        # 2) Levenshtein 熔断：改动>15% 视为过度改写/润色（短句至少容忍1字同音错，向上取整避免5字改1字被误熔）
+        dist = ASRCorrector._levenshtein(o, c)
+        thresh = max(1.0, lo * 0.15)
+        if dist > thresh + 1e-9:
             return False, c
         for junk in JUNK_WORDS:
             if junk in c and junk not in o:
