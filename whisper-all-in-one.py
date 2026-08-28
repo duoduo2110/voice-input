@@ -307,7 +307,7 @@ def type_via_clipboard(text):
 # 快捷按键分发 (严格白名单, 拒绝任意命令注入)
 # ---------------------------------------------------------------------------
 # 仅允许以下动作; 每个动作映射到硬编码的 xdotool 参数列表, 不接受任意输入
-KEY_ACTIONS = ("backspace1", "backspace2", "clear", "enter")
+KEY_ACTIONS = ("backspace1", "backspace2", "space", "clear", "enter")
 
 
 def _send_keys(combo, env):
@@ -318,6 +318,7 @@ def _send_keys(combo, env):
 def dispatch_key(action):
     """按白名单动作向当前活动窗口发送按键。返回 (ok, message)。
     - backspace1/2: 删除 1/2 个字符 (BackSpace)
+    - space: 发送空格 (space)
     - clear: 清空输入框 (终端 -> ctrl+c 中断行输入; GUI -> ctrl+a 全选后删除)
     - enter: 发送回车 (Return)
     非白名单动作一律拒绝, 绝不将用户输入拼接进 xdotool 命令。"""
@@ -330,6 +331,8 @@ def dispatch_key(action):
             _send_keys(["BackSpace"], env)
         elif action == "backspace2":
             _send_keys(["BackSpace", "BackSpace"], env)
+        elif action == "space":
+            _send_keys(["space"], env)
         elif action == "enter":
             _send_keys(["Return"], env)
         elif action == "clear":
@@ -1066,18 +1069,18 @@ h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135de
 }
 @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
 /* ---------- 快捷编辑工具栏 (毛玻璃 + 动态触感涟漪特效) ---------- */
-.keys{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:16px}
+.keys{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:16px}
 .keys button{
   position:relative;overflow:hidden;
   -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
   background:linear-gradient(160deg,rgba(255,255,255,.10),rgba(255,255,255,.03));
   border:1px solid rgba(255,255,255,.16);border-radius:14px;color:var(--fg);
-  font-size:11px;padding:9px 2px;cursor:pointer;line-height:1.3;
+  font-size:10.5px;padding:9px 1px;cursor:pointer;line-height:1.3;
   touch-action:manipulation;-webkit-tap-highlight-color:transparent;
   transition:transform .08s cubic-bezier(.34,1.56,.64,1),background .15s ease,box-shadow .15s ease,border-color .15s ease;
 }
-.keys button b{display:block;font-size:17px;font-weight:600;margin-bottom:1px;pointer-events:none}
-.keys button small{display:block;color:var(--muted);font-size:10px;pointer-events:none}
+.keys button b{display:block;font-size:16px;font-weight:600;margin-bottom:1px;pointer-events:none}
+.keys button small{display:block;color:var(--muted);font-size:9.5px;pointer-events:none}
 .keys button:active{
   transform:scale(.88);
   background:rgba(255,255,255,.22);
@@ -1126,6 +1129,7 @@ h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135de
     <div class="keys" id="keys">
       <button id="kDel1"  type="button" aria-label="删除1字"><b>⌫</b><small>删1字</small></button>
       <button id="kDel2"  type="button" aria-label="删除2字"><b>⌫⌫</b><small>删2字</small></button>
+      <button id="kSpace" type="button" aria-label="空格"><b>␣</b><small>空格</small></button>
       <button id="kClear" type="button" aria-label="清空输入框"><b>🗑️</b><small>清空</small></button>
       <button id="kEnter" type="button" aria-label="换行"><b>↵</b><small>换行</small></button>
     </div>
@@ -1140,7 +1144,14 @@ h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135de
         <label><input id="optEnterSend" type="checkbox"> 按换行即发送</label>
       </div>
       <button id="phoneSend" class="phone-send" type="button">🚀 发送至电脑</button>
-      <div class="phone-hint">超大拇指按钮 · 轻点即毫秒级打字到电脑光标处 · 可连续发送</div>
+      <div class="keys phone-keys" id="phoneKeys">
+        <button id="kPhoneDel1"  type="button" aria-label="电脑删除1字"><b>⌫</b><small>删1字</small></button>
+        <button id="kPhoneDel2"  type="button" aria-label="电脑删除2字"><b>⌫⌫</b><small>删2字</small></button>
+        <button id="kPhoneSpace" type="button" aria-label="电脑空格"><b>␣</b><small>空格</small></button>
+        <button id="kPhoneClear" type="button" aria-label="电脑清空"><b>🗑️</b><small>清空</small></button>
+        <button id="kPhoneEnter" type="button" aria-label="电脑换行"><b>↵</b><small>换行</small></button>
+      </div>
+      <div class="phone-hint">超大拇指按钮 · 轻点即毫秒级打字到电脑光标处 · 支持电脑删除/空格/换行</div>
     </div>
   </div>
 </div>
@@ -1421,6 +1432,8 @@ function keyVibrate(action){
       navigator.vibrate(28);                      // 删1字: 清脆短震
     } else if (action === "backspace2") {
       navigator.vibrate([22, 35, 22]);            // 删2字: 动感双震
+    } else if (action === "space") {
+      navigator.vibrate(20);                      // 空格: 极短轻震
     } else if (action === "clear") {
       navigator.vibrate([40, 40, 70]);            // 清空: 警示重击感震动
     } else if (action === "enter") {
@@ -1445,8 +1458,16 @@ function keyAction(action, btn, e){
 
 $("kDel1").onpointerdown  = (e) => { e.preventDefault(); keyAction("backspace1", $("kDel1"), e); };
 $("kDel2").onpointerdown  = (e) => { e.preventDefault(); keyAction("backspace2", $("kDel2"), e); };
+$("kSpace").onpointerdown = (e) => { e.preventDefault(); keyAction("space", $("kSpace"), e); };
 $("kClear").onpointerdown = (e) => { e.preventDefault(); keyAction("clear", $("kClear"), e); };
 $("kEnter").onpointerdown = (e) => { e.preventDefault(); keyAction("enter", $("kEnter"), e); };
+
+// 手机输入法直发面板专属按键绑定
+$("kPhoneDel1").onpointerdown  = (e) => { e.preventDefault(); keyAction("backspace1", $("kPhoneDel1"), e); };
+$("kPhoneDel2").onpointerdown  = (e) => { e.preventDefault(); keyAction("backspace2", $("kPhoneDel2"), e); };
+$("kPhoneSpace").onpointerdown = (e) => { e.preventDefault(); keyAction("space", $("kPhoneSpace"), e); };
+$("kPhoneClear").onpointerdown = (e) => { e.preventDefault(); keyAction("clear", $("kPhoneClear"), e); };
+$("kPhoneEnter").onpointerdown = (e) => { e.preventDefault(); keyAction("enter", $("kPhoneEnter"), e); };
 
 /* ---------- LLM 智能纠错开关 (与后端 ENABLE_LLM_CORRECT 同步，默认关=Whisper原文直出) ---------- */
 let llmCorrect = false;
