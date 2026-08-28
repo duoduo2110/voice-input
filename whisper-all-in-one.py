@@ -8,12 +8,17 @@ whisper-all-in-one.py — 方案 B: All-in-One 纯净容器 (零 AudioRelay / �
   端口   协议   服务
   ----   ----   --------------------------------------------------------
   28768  HTTPS  手机 Web 麦克风页面 + WSS WebSocket(/stream) 同端口
-                (单端口单证书 = 浏览器信任一次即同时覆盖页面与麦克风推流,
-                 规避 iOS/新版 Chrome 的跨端口证书拦截问题)
+                 (单端口单证书 = 浏览器信任一次即同时覆盖页面与麦克风推流,
+                  规避 iOS/新版 Chrome 的跨端口证书拦截问题)
   61394  TCP    第三方原生推流工具原始 PCM 字节直连 (EOF 或 "STOP" 停止)
   8766   HTTP   宿主机/RustDesk 内部浏览器快速控制 API (/toggle, /status, /healthz)
   28765  HTTP   http:// -> https://28768 的跳转入口
   (端口均可经环境变量 WEB_PORT / CTRL_PORT / REDIR_PORT / TCP_PORT 覆盖)
+
+部署模式 (DEPLOY_MODE):
+  all (默认)        双引擎全功能：GPU 语音 + 手机输入法直发 Tab 切换
+  ime / web_ime_only  纯手机输入法极轻量：零 Whisper/零 CUDA/零 LLM，<1s 启动，0MB 显存，仅保留直发与快捷键
+  gpu / gpu_asr_only  纯GPU语音：仅加载 Whisper large-v3-turbo，页面仅语音按钮
 
 信号链路 (宿主机 F9):
   voice-toggle.sh -> SIGUSR1(/home/ipc: /tmp/whisper-ipc/whisper-dictation.pid)
@@ -41,7 +46,6 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import numpy as np
 import websockets
 from websockets.datastructures import Headers
 from websockets.http11 import Response as WSResponse
@@ -50,7 +54,39 @@ try:
     from websockets.exceptions import ConnectionClosed
 except ImportError:  # websockets < 10
     from websockets import ConnectionClosed
-from faster_whisper import WhisperModel
+
+# ---------------------------------------------------------------------------
+# 部署模式 (DEPLOY_MODE): all | ime(=web_ime_only) | gpu(=gpu_asr_only)
+# ---------------------------------------------------------------------------
+_RAW_MODE = os.environ.get("DEPLOY_MODE", "all").strip().lower()
+if _RAW_MODE in ("ime", "web_ime_only", "web-ime-only", "web", "phone", "type"):
+    DEPLOY_MODE = "ime"
+elif _RAW_MODE in ("gpu", "gpu_asr_only", "gpu-asr-only", "asr", "whisper"):
+    DEPLOY_MODE = "gpu"
+else:
+    DEPLOY_MODE = "all"
+IS_IME_ONLY = DEPLOY_MODE == "ime"
+IS_GPU_ONLY = DEPLOY_MODE == "gpu"
+# 向后兼容：ime 模式下强制禁用纠错，gpu/all 保持原开关逻辑
+if IS_IME_ONLY:
+    os.environ["ENABLE_LLM_CORRECT"] = "false"
+
+# numpy 仅 GPU 转录需要；ime 模式下完全不导入，缩短启动与依赖
+np = None
+if not IS_IME_ONLY:
+    try:
+        import numpy as _np
+        np = _np
+    except Exception:
+        pass
+FasterWhisperModel = None
+if not IS_IME_ONLY:
+    try:
+        from faster_whisper import WhisperModel as _WhisperModel
+        FasterWhisperModel = _WhisperModel
+    except Exception as _e:
+        # ime 模式下本不使用；gpu/all 下若导入失败则启动时再报错
+        print(f"[AllInOne] faster-whisper 导入失败（ime 模式可忽略）: {_e}", flush=True)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -76,29 +112,42 @@ RECORD_LAN = 0
 START_TIME = time.time()
 
 # ---------------------------------------------------------------------------
-# 环境自检 / 模型加载 (模型加载成功才写 pid, 保证"就绪"语义)
+# 环境自检 / 模型加载（按 DEPLOY_MODE 按需加载）
 # ---------------------------------------------------------------------------
-print(f"[AllInOne] DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}", flush=True)
+print(f"[AllInOne] DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}  DEPLOY_MODE={DEPLOY_MODE}", flush=True)
 print(f"[AllInOne] XAUTHORITY={os.environ.get('XAUTHORITY', 'NOT SET')}", flush=True)
-print(f"[AllInOne] 正在加载 {MODEL_NAME} (CUDA float16) ...", flush=True)
-MODEL = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
-print(f"[AllInOne] {MODEL_NAME} 加载完成。", flush=True)
+
+MODEL = None
+if IS_IME_ONLY:
+    print("[AllInOne] DEPLOY_MODE=ime 纯手机输入法直发：跳过 Whisper/CUDA/LLM，<1s 极速启动，0 MB 显存", flush=True)
+else:
+    if FasterWhisperModel is None:
+        print("[AllInOne] 致命：DEPLOY_MODE 需要 faster-whisper 但导入失败，无法提供 GPU 语音", flush=True)
+        sys.exit(1)
+    print(f"[AllInOne] 正在加载 {MODEL_NAME} (CUDA float16) ...", flush=True)
+    MODEL = FasterWhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
+    print(f"[AllInOne] {MODEL_NAME} 加载完成。", flush=True)
 
 # ---------------------------------------------------------------------------
 # 本地轻量 LLM 智能纠错引擎 (Qwen2.5-0.5B-Instruct, CUDA fp16 ~1GB)
-# 可用环境变量 ENABLE_LLM_CORRECT=false 关闭; 异常时自动回退原始 ASR 文本
+# ime 模式下完全跳过；可用环境变量 ENABLE_LLM_CORRECT=false 关闭
 # ---------------------------------------------------------------------------
 CORRECTOR = None
-try:
-    from corrector import ASRCorrector
-    CORRECTOR = ASRCorrector()
-except Exception as e:
-    print(f"[AllInOne] 智能纠错引擎不可用: {e}", flush=True)
-    CORRECTOR = None
+if IS_IME_ONLY:
+    print("[AllInOne] DEPLOY_MODE=ime：智能纠错引擎已禁用（不占显存）", flush=True)
+else:
+    try:
+        from corrector import ASRCorrector
+        CORRECTOR = ASRCorrector()
+    except Exception as e:
+        print(f"[AllInOne] 智能纠错引擎不可用: {e}", flush=True)
+        CORRECTOR = None
 
 
 def set_corrector_enabled(on):
     """运行时开关 LLM 纠错; 返回实际生效状态。"""
+    if IS_IME_ONLY:
+        return False
     if CORRECTOR is not None:
         return CORRECTOR.set_enabled(on)
     return False
@@ -447,6 +496,18 @@ def begin_stop_and_transcribe():
 
 def _transcribe_worker(raw, src):
     global transcribing
+    if IS_IME_ONLY or MODEL is None:
+        print(f"[AllInOne] ime 模式：忽略音频转录请求 ({len(raw)}B, 来源={src})", flush=True)
+        with lock:
+            transcribing = False
+        write_state("IDLE")
+        return
+    if np is None:
+        print(f"[AllInOne] numpy 不可用，无法转录", flush=True)
+        with lock:
+            transcribing = False
+        write_state("IDLE")
+        return
     try:
         if len(raw) < MIN_BYTES:
             print(f"[AllInOne] 音频过短({len(raw)}B), 跳过转录。", flush=True)
@@ -482,7 +543,10 @@ def _transcribe_worker(raw, src):
 
 
 def toggle_record():
-    """统一切换入口(SIGUSR1 / HTTP /toggle 均走此)。"""
+    """统一切换入口(SIGUSR1 / HTTP /toggle 均走此)。ime 模式下直接拒绝。"""
+    if IS_IME_ONLY:
+        print("[AllInOne] ime 模式：toggle 已禁用（无 Whisper 链路）", flush=True)
+        return False
     global recording, transcribing
     with lock:
         if transcribing:
@@ -554,6 +618,39 @@ async def ws_handler(ws):
     global wss_clients
     with lock:
         wss_clients += 1
+    # ime 模式下 WSS 仅用于直发/按键，不进入录音会话
+    if IS_IME_ONLY:
+        try:
+            await ws.send(json.dumps({"status": "IME_ONLY", "deploy_mode": DEPLOY_MODE}))
+            async for msg in ws:
+                if isinstance(msg, bytes):
+                    continue
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    data = {"cmd": str(msg)}
+                cmd = data.get("cmd")
+                if cmd == "type":
+                    txt = str(data.get("text") or data.get("t") or "")
+                    res = _type_response_payload(txt)
+                    try:
+                        await ws.send(json.dumps({"status": "TYPE", **res}))
+                    except Exception:
+                        pass
+                elif cmd == "key":
+                    ok, m2 = dispatch_key(data.get("action") or "")
+                    try:
+                        await ws.send(json.dumps({"status": "KEY", "ok": ok, "action": m2}))
+                    except Exception:
+                        pass
+                elif cmd == "stop":
+                    break
+        except ConnectionClosed:
+            pass
+        finally:
+            with lock:
+                wss_clients -= 1
+        return
     started = False
     try:
         if not begin_recording("web"):
@@ -616,6 +713,11 @@ def _http_response(status, ctype, body):
     return WSResponse(status, reason, headers, body)
 
 
+def _render_html_page():
+    """按 DEPLOY_MODE 注入前端裁剪标记（__DEPLOY_MODE__ 替换为 all/ime/gpu）。"""
+    return HTML_PAGE_TEMPLATE.replace("__DEPLOY_MODE__", DEPLOY_MODE)
+
+
 async def http_process_request(connection, request):
     """同一 TLS 端口上的 HTTP/WS 路由:
     /stream 且携带 Upgrade: websocket -> 返回 None 交给 WebSocket handler;
@@ -639,7 +741,7 @@ async def http_process_request(connection, request):
         return _http_response(404, "text/plain; charset=utf-8", b"not found")
     if path in ("/", "/index.html"):
         return _http_response(200, "text/html; charset=utf-8",
-                              HTML_PAGE.encode("utf-8"))
+                              _render_html_page().encode("utf-8"))
     if path == "/toggle":
         toggle_record()
         return _http_response(200, "application/json; charset=utf-8",
@@ -699,6 +801,12 @@ async def web_main(ssl_ctx):
 # ---------------------------------------------------------------------------
 def tcp_session(conn):
     global tcp_clients
+    if IS_IME_ONLY:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
     started = False
     try:
         with lock:
@@ -733,6 +841,10 @@ def tcp_session(conn):
 
 
 def tcp_main():
+    if IS_IME_ONLY:
+        print(f"[AllInOne] DEPLOY_MODE=ime：跳过 TCP {TCP_PORT} 监听（零音频链路）", flush=True)
+        while True:
+            time.sleep(3600)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", TCP_PORT))
@@ -750,6 +862,7 @@ def status_payload():
     with lock:
         return {
             "service": "whisper-all-in-one",
+            "deploy_mode": DEPLOY_MODE,
             "state": current_state(),
             "recording": recording,
             "transcribing": transcribing,
@@ -759,16 +872,16 @@ def status_payload():
             "tcp_clients": tcp_clients,
             "pid": os.getpid(),
             "uptime_s": int(time.time() - START_TIME),
-            "model": MODEL_NAME,
-            "llm_correct": bool(CORRECTOR is not None and CORRECTOR.enabled),
-            "llm_model": (CORRECTOR.model_name if CORRECTOR else ""),
-"ports": {"web": WEB_PORT, "wss": WEB_PORT,   # WSS 与 HTTPS 同端口(28768)
-          "ctrl": CTRL_PORT, "tcp": TCP_PORT,
-          "redirect": REDIR_PORT},
+            "model": ("" if IS_IME_ONLY else MODEL_NAME),
+            "llm_correct": bool(not IS_IME_ONLY and CORRECTOR is not None and CORRECTOR.enabled),
+            "llm_model": ("" if IS_IME_ONLY else (CORRECTOR.model_name if CORRECTOR else "")),
+            "ports": {"web": WEB_PORT, "wss": WEB_PORT,   # WSS 与 HTTPS 同端口(28768)
+                      "ctrl": CTRL_PORT, "tcp": TCP_PORT,
+                      "redirect": REDIR_PORT},
         }
 
 
-HTML_PAGE = r"""<!doctype html>
+HTML_PAGE_TEMPLATE = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -1512,14 +1625,61 @@ async function pollStatus(){
   try {
     const r = await fetch("/status", { cache: "no-store" });
     const j = await r.json();
-    setStatus("服务器状态: " + j.state + (j.state === "RECORDING" ? " · 已收 " + j.audio_bytes + " B" : ""));
+    const m = j.deploy_mode || "all";
+    const base = (m === "ime") ? ("📱 轻量直发 · " + j.state) : ("服务器状态: " + j.state + (j.state === "RECORDING" ? " · 已收 " + j.audio_bytes + " B" : ""));
+    setStatus(base);
     if (j.llm_correct !== undefined){ llmCorrect = !!j.llm_correct; updateCorrUI(); }
   } catch (_) { setStatus("服务器离线"); }
 }
 setInterval(pollStatus, 2000);
 pollStatus();
 
-probePermission();
+// DEPLOY_MODE 前端裁剪：ime 仅直发面板，gpu 仅语音面板，all 保留 Tab
+(function(){
+  const DM = "__DEPLOY_MODE__";
+  const hdrSub  = document.querySelector("header .sub");
+  const enginesEl = document.querySelector(".engines");
+  const corrBtn = $("corrToggle");
+  const keysEl  = document.querySelector(".keys");
+  // phone 直发的快捷键栏在 gpu/ime 下也要保留——ime 纯面板自带、gpu 面板底部也保留
+  function moveKeysIntoPhoneCard(){
+    if (!keysEl || keysEl.dataset.moved === "1") return;
+    const card = document.querySelector(".phone-card");
+    if (!card) return;
+    card.appendChild(keysEl);
+    keysEl.dataset.moved = "1";
+    keysEl.style.marginTop = "8px";
+  }
+  if (DM === "ime"){
+    if (hdrSub) hdrSub.textContent = "📱 手机输入法直发 · 毫秒级打字到电脑光标";
+    if (enginesEl) enginesEl.style.display = "none";
+    if (corrBtn) corrBtn.style.display = "none";
+    const pG = $("panelGpu"), pP = $("panelPhone");
+    if (pG) pG.hidden = true;
+    if (pP) pP.hidden = false;
+    // 禁用语音相关初始化
+    window.__DEPLOY_MODE_IME__ = true;
+  } else if (DM === "gpu"){
+    if (hdrSub) hdrSub.textContent = "🎙️ GPU 语音输入 · 说话即转录上屏";
+    if (enginesEl) enginesEl.style.display = "none";
+    const pG = $("panelGpu"), pP = $("panelPhone");
+    if (pG) pG.hidden = false;
+    if (pP) pP.hidden = true;
+    moveKeysIntoPhoneCard(); // gpu 模式下快捷键随直发面板一起保留到底部
+    const hint = document.querySelector(".phone-hint");
+    if (hint) hint.textContent = "快捷键同样可用 · 输入法直发可经 /type 接口使用";
+    window.__DEPLOY_MODE_GPU__ = true;
+  }
+})();
+
+// 仅非 ime 模式才初始化麦克风权限探测与音频管线相关引导
+if (!window.__DEPLOY_MODE_IME__){
+  probePermission();
+} else {
+  setStatus("📱 纯输入法直发就绪 · 无需麦克风权限");
+  hideBanner();
+  const g = $("guide"); if (g) g.style.display = "none";
+}
 
 window.addEventListener("pagehide", () => {
   if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
@@ -1615,8 +1775,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect(f"https://{host}:{WEB_PORT}/")
             else:  # api (8766 控制口; HTTPS 页面由 websockets 同端口提供)
                 if path == "/toggle":
-                    toggle_record()
-                    self._json(status_payload())
+                    if IS_IME_ONLY:
+                        self._json({"ok": False, "error": "ime mode: toggle disabled", "deploy_mode": DEPLOY_MODE}, 400)
+                    else:
+                        toggle_record()
+                        self._json(status_payload())
                 elif path == "/status":
                     self._json(status_payload())
                 elif path == "/healthz":
@@ -1657,8 +1820,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/corrector":
                 self._do_corrector()
             elif path == "/toggle":
-                toggle_record()
-                self._json(status_payload())
+                if IS_IME_ONLY:
+                    self._json({"ok": False, "error": "ime mode: toggle disabled", "deploy_mode": DEPLOY_MODE}, 400)
+                else:
+                    toggle_record()
+                    self._json(status_payload())
             else:
                 self._text("not found", 404)
         except BrokenPipeError:
@@ -1739,15 +1905,19 @@ def main():
     threading.Thread(target=tcp_main, daemon=True, name="tcp").start()
 
     ip = detect_lan_ip()
-    print(f"[AllInOne] 守护进程就绪 (PID {os.getpid()}).", flush=True)
-    print(f"[AllInOne] 手机麦克风页:  https://{ip}:{WEB_PORT}/  "
-          f"(页面与 WSS 同端口, 扫码访问并信任自签证书)", flush=True)
-    print(f"[AllInOne] 控制 API:      http://127.0.0.1:{CTRL_PORT}/toggle  "
-          f"/status /healthz", flush=True)
-    print(f"[AllInOne] WSS 推流:      wss://{ip}:{WEB_PORT}/stream  "
-          f"(与 HTTPS 同端口, 16kHz PCM s16le mono)", flush=True)
-    print(f"[AllInOne] TCP 直推:      {ip}:{TCP_PORT}  "
-          f"(原始 PCM 字节流, EOF/STOP 结束)", flush=True)
+    print(f"[AllInOne] 守护进程就绪 (PID {os.getpid()}, DEPLOY_MODE={DEPLOY_MODE}).", flush=True)
+    print(f"[AllInOne] 手机直发:       https://{ip}:{WEB_PORT}/  (全模式可用)", flush=True)
+    if IS_IME_ONLY:
+        print(f"[AllInOne] 当前为 ime 轻量模式：仅直发/按键，零 Whisper/零 CUDA", flush=True)
+    else:
+        print(f"[AllInOne] 手机麦克风页:  https://{ip}:{WEB_PORT}/  "
+              f"(页面与 WSS 同端口, 扫码访问并信任自签证书)", flush=True)
+        print(f"[AllInOne] WSS 推流:      wss://{ip}:{WEB_PORT}/stream  "
+              f"(与 HTTPS 同端口, 16kHz PCM s16le mono)", flush=True)
+        print(f"[AllInOne] TCP 直推:      {ip}:{TCP_PORT}  "
+              f"(原始 PCM 字节流, EOF/STOP 结束)", flush=True)
+    print(f"[AllInOne] 控制 API:      http://127.0.0.1:{CTRL_PORT}/status /key /type"
+          f"{' /toggle(ime禁用)' if IS_IME_ONLY else ' /toggle'}", flush=True)
 
     while True:
         time.sleep(60)

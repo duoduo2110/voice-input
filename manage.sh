@@ -2,12 +2,12 @@
 # manage.sh — Whisper All-in-One 语音输入系统一键运维脚本 (方案 B, 最终交付)
 # ----------------------------------------------------------------------------
 # 用法:
-#   ./manage.sh start              构建并启动容器, 等待 Whisper 守护进程就绪
+#   ./manage.sh start [all|ime|gpu]  指定部署模式启动 (all=全功能双引擎[默认], ime=纯手机输入法直发[零GPU/零显存], gpu=纯GPU语音)
 #   ./manage.sh stop               停止容器 (容器与数据保留)
 #   ./manage.sh restart            重启容器并等待就绪
-#   ./manage.sh status             容器健康 / GPU 显存 / 服务端点 / IPC 通道看板
+#   ./manage.sh status             容器健康 / GPU 显存 / 服务端点 / IPC 通道看板 (按 DEPLOY_MODE 差异化提示)
 #   ./manage.sh logs [N]           跟随日志 (N=行数时不跟随)
-#   ./manage.sh toggle             触发一次「录音 <-> 转录上屏」(等效 F9)
+#   ./manage.sh toggle             触发一次「录音 <-> 转录上屏」(等效 F9, ime 模式下提示不可用)
 #   ./manage.sh url                打印手机/电脑访问地址
 #   ./manage.sh certs [IP]         重新生成自签证书 (默认自动探测局域网 IP)
 #
@@ -104,25 +104,56 @@ compose() {
     docker compose -f "$COMPOSE_FILE" "$@"
 }
 
+# ---- 部署模式解析 -----------------------------------------------------------
+# deploy_arg in -> DEPLOY_MODE env: all | ime | gpu (+ 别名)
+normalize_mode() {
+    case "${1,,}" in
+        ""|"all"|"full"|"dual") echo "all" ;;
+        ime|web_ime_only|web-ime-only|web|phone|type) echo "ime" ;;
+        gpu|gpu_asr_only|gpu-asr-only|asr|whisper) echo "gpu" ;;
+        *) echo "all" ;;
+    esac
+}
+
 # ---- 子命令实现 -------------------------------------------------------------
 cmd_start() {
+    local arg_mode="${1:-}"
+    local deploy_mode
+    deploy_mode="$(normalize_mode "$arg_mode")"
+    export DEPLOY_MODE="$deploy_mode"
     mkdir -p "$IPC_DIR" 2>/dev/null || true
     if container_running; then
-        ok "容器 $CONTAINER 已在运行"
-        daemon_ready && ok "Whisper 守护进程就绪, 可直接按 F9 使用" \
-                    || warn "容器运行中但模型尚未就绪, 请稍候"
-        return 0
+        local cur_mode
+        cur_mode="$(docker exec "$CONTAINER" printenv DEPLOY_MODE 2>/dev/null || echo "unknown")"
+        if [ "$cur_mode" = "$deploy_mode" ]; then
+            ok "容器 $CONTAINER 已在运行 (DEPLOY_MODE=$deploy_mode)"
+            daemon_ready && ok "守护进程就绪" || warn "容器运行中但守护进程尚未就绪, 请稍候"
+            return 0
+        fi
+        info "当前容器 DEPLOY_MODE=$cur_mode，目标 $deploy_mode，正在重建容器..."
+        compose up -d --build || { err "docker compose up 失败"; return 1; }
+    else
+        info "正在构建并启动容器 $CONTAINER (DEPLOY_MODE=$deploy_mode) ..."
+        compose up -d --build || { err "docker compose up 失败"; return 1; }
     fi
-    info "正在构建并启动容器 $CONTAINER ..."
-    compose up -d --build || { err "docker compose up 失败"; return 1; }
-    info "等待 Whisper 守护进程就绪 (最长 ${START_TIMEOUT}s, 首启需加载 large-v3-turbo)..."
-    if wait_ready "$START_TIMEOUT"; then
+    local wait_secs="$START_TIMEOUT"
+    [ "$deploy_mode" = "ime" ] && wait_secs=30
+    info "等待守护进程就绪 (DEPLOY_MODE=$deploy_mode, 最长 ${wait_secs}s${deploy_mode:+，ime 模式 <5s})..."
+    if wait_ready "$wait_secs"; then
         printf '\n'
-        ok "✅ 启动完成: Whisper GPU 守护进程已就绪"
-        info "按 F9 / ./manage.sh toggle / 手机访问 $(web_url) 即可开始语音输入"
+        if [ "$deploy_mode" = "ime" ]; then
+            ok "✅ 启动完成: 纯手机输入法直发模式就绪 (零GPU/零显存, <1s 启动)"
+            info "手机访问 $(web_url) 直发文本 / 快捷键自动粘贴，无需麦克风权限"
+        elif [ "$deploy_mode" = "gpu" ]; then
+            ok "✅ 启动完成: 纯GPU语音模式就绪 (Whisper large-v3-turbo 已常驻)"
+            info "按 F9 / ./manage.sh toggle / 手机访问 $(web_url) 开始语音输入"
+        else
+            ok "✅ 启动完成: 全功能双引擎模式就绪"
+            info "按 F9 / ./manage.sh toggle / 手机访问 $(web_url) 即可开始语音输入 / 输入法直发"
+        fi
     else
         printf '\n'
-        warn "容器已启动, 但 ${START_TIMEOUT}s 内未检测到守护进程就绪"
+        warn "容器已启动, 但 ${wait_secs}s 内未检测到守护进程就绪"
         info "请观察: ./manage.sh logs, 或用 ./manage.sh status 复查"
         return 1
     fi
@@ -154,42 +185,61 @@ cmd_restart() {
 
 cmd_status() {
     local ip="$(lan_ip)"
-    header "容器状态"
+    local deploy_mode
+    deploy_mode="$(docker exec "$CONTAINER" printenv DEPLOY_MODE 2>/dev/null || echo "?")"
+    [ "$deploy_mode" = "?" ] && deploy_mode="${DEPLOY_MODE:-all}"
+    header "容器状态 (DEPLOY_MODE=$deploy_mode)"
     if container_running; then
         local health st pid
         health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER" 2>/dev/null)"
-        ok "$CONTAINER 运行中 (health: ${health:-unknown})"
+        ok "$CONTAINER 运行中 (health: ${health:-unknown}, mode: $deploy_mode)"
         if daemon_ready; then
             pid="$(cat "$PID_FILE" 2>/dev/null || true)"
             st="$(cat "$STATE_FILE" 2>/dev/null || true)"
-            ok "Whisper 守护进程就绪, PID=${pid:-?}, 状态=${st:-?}"
+            if [ "$deploy_mode" = "ime" ]; then
+                ok "轻量直发守护进程就绪 (零GPU), PID=${pid:-?}, 状态=${st:-?}  [ime 模式: 零显存/极速启动]"
+            else
+                ok "Whisper 守护进程就绪, PID=${pid:-?}, 状态=${st:-?}"
+            fi
         else
             warn "容器运行中, 但守护进程未就绪 (模型加载中或异常)"
         fi
     else
         err "$CONTAINER 未运行"
-        info "执行 ./manage.sh start 启动"
+        info "执行 ./manage.sh start [all|ime|gpu] 启动 (默认 all)"
     fi
 
-    header "GPU 状态 (RTX 2080 Ti)"
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        local gpu gname gtot gused gutil gtemp
-        gpu="$(nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu \
-               --format=csv,noheader,nounits 2>/dev/null | head -1)"
-        if [ -n "$gpu" ]; then
-            gname="$(cut -d, -f1 <<<"$gpu" | xargs)"
-            gtot="$(cut -d, -f2 <<<"$gpu" | xargs)"
-            gused="$(cut -d, -f3 <<<"$gpu" | xargs)"
-            gutil="$(cut -d, -f4 <<<"$gpu" | xargs)"
-            gtemp="$(cut -d, -f5 <<<"$gpu" | xargs)"
-            ok "${gname} | 显存 ${gused} / ${gtot} MiB | 利用率 ${gutil}% | 温度 ${gtemp}°C"
-            [[ "${gused:-0}" =~ ^[0-9]+$ ]] && [ "$gused" -gt 1000 ] \
-                && info "large-v3-turbo 已常驻显存"
+    if [ "$deploy_mode" = "ime" ]; then
+        header "资源占用 (ime 轻量模式)"
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            local gused
+            gused="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "?")"
+            ok "当前模式 ime：容器不占用 GPU 显存（宿主机总显存使用 ${gused:-?} MiB 为其他进程占用） ✓ 0 MB 来自语音容器"
+            info "内存 ~30MB 纯 Python 异步服务，无 CUDA/PyTorch/Whisper/LLM 常驻"
         else
-            err "nvidia-smi 查询失败 (驱动/运行时异常)"
+            ok "当前模式 ime：零 GPU 依赖，不查询 nvidia-smi"
         fi
     else
-        warn "宿主机未安装 nvidia-smi"
+        header "GPU 状态 (RTX 2080 Ti)"
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            local gpu gname gtot gused gutil gtemp
+            gpu="$(nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu \
+                   --format=csv,noheader,nounits 2>/dev/null | head -1)"
+            if [ -n "$gpu" ]; then
+                gname="$(cut -d, -f1 <<<"$gpu" | xargs)"
+                gtot="$(cut -d, -f2 <<<"$gpu" | xargs)"
+                gused="$(cut -d, -f3 <<<"$gpu" | xargs)"
+                gutil="$(cut -d, -f4 <<<"$gpu" | xargs)"
+                gtemp="$(cut -d, -f5 <<<"$gpu" | xargs)"
+                ok "${gname} | 显存 ${gused} / ${gtot} MiB | 利用率 ${gutil}% | 温度 ${gtemp}°C"
+                [[ "${gused:-0}" =~ ^[0-9]+$ ]] && [ "$gused" -gt 1000 ] \
+                    && info "large-v3-turbo 已常驻显存"
+            else
+                err "nvidia-smi 查询失败 (驱动/运行时异常)"
+            fi
+        else
+            warn "宿主机未安装 nvidia-smi"
+        fi
     fi
 
     header "服务端点 (host 网络, IP=$ip)"
@@ -213,6 +263,9 @@ cmd_status() {
     js="$(curl -fsS --max-time 3 "$CTRL_URL/status" 2>/dev/null || true)"
     if [ -n "$js" ]; then
         ok "$js"
+        if echo "$js" | grep -q '"deploy_mode"[[:space:]]*:[[:space:]]*"ime"'; then
+            info "ime 模式下音频链路已禁用，按键/直发可用，音频转录不可用（预期行为）"
+        fi
     else
         err "控制 API 无响应 (守护进程未就绪 / 端口未监听)"
         info "检查: ./manage.sh logs"
@@ -225,8 +278,13 @@ cmd_status() {
         warn "pid 文件缺失 (守护进程尚未写盘或已退出)"
     fi
     printf '\n'
-    info "状态说明: IDLE 待命 | RECORDING 录音中 | TRANSCRIBING GPU 转录中"
-    info "Web 触发: $CTRL_URL/toggle   (或按 F9)"
+    if [ "$deploy_mode" = "ime" ]; then
+        info "ime 轻量模式: 仅手机输入法直发 + 快捷键，无 F9/录音/转录"
+        info "Web 直发:  $CTRL_URL/type?t=文本  或  https://$ip:$WEB_PORT/type?t=文本"
+    else
+        info "状态说明: IDLE 待命 | RECORDING 录音中 | TRANSCRIBING GPU 转录中"
+        info "Web 触发: $CTRL_URL/toggle   (或按 F9)"
+    fi
     return 0
 }
 
@@ -279,15 +337,18 @@ cmd_certs() {
 
 usage() {
     cat <<EOF
-Usage: ./manage.sh <command>
+Usage: ./manage.sh <command> [args]
 
 Commands:
-  start     构建并启动容器, 等待 Whisper 守护进程就绪
+  start [all|ime|gpu]  按部署模式构建并启动容器 (all=全功能[默认] | ime=纯输入法直发零显存 | gpu=纯GPU语音)
+                       例: ./manage.sh start ime   -> 极轻量 <1s 启动, 0 MB 显存
+                           ./manage.sh start all   -> 双引擎全功能
+                           ./manage.sh start gpu   -> 仅 GPU 语音
   stop      停止容器 (容器与数据保留)
-  restart   重启容器并等待就绪
-  status    容器健康 / GPU 显存 / 服务端点 / IPC 通道看板
+  restart   重启容器并等待就绪 (保持当前 DEPLOY_MODE)
+  status    容器健康 / GPU 显存 / 服务端点 / IPC 通道看板 (按 DEPLOY_MODE 差异化展示)
   logs [N]  跟随容器日志 (>N 行时不跟随)
-  toggle    触发一次「录音 <-> 转录上屏」(等效 F9)
+  toggle    触发一次「录音 <-> 转录上屏」(等效 F9, ime 模式下提示不可用)
   url       打印手机/电脑访问地址
   certs [IP]  重新生成自签证书 (默认自动探测局域网 IP)
 EOF
@@ -297,7 +358,7 @@ EOF
 main() {
     local cmd="${1:-}"; shift 2>/dev/null || true
     case "$cmd" in
-        start)   cmd_start ;;
+        start)   cmd_start "$@" ;;
         stop)    cmd_stop ;;
         restart) cmd_restart ;;
         status)  cmd_status ;;

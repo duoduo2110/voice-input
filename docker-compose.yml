@@ -14,6 +14,7 @@
 #   DISPLAY=:1
 #   XAUTHORITY_HOST=/run/user/1000/gdm/Xauthority   # 或 $XAUTHORITY / ~/.Xauthority
 #   HF_CACHE_HOST=/home/tt/.cache/huggingface
+#   DEPLOY_MODE=all   # 可选 all(全功能) | ime/web_ime_only(纯输入法直发, 零GPU) | gpu/gpu_asr_only(纯GPU语音)
 #   WEB_PORT=28768   REDIR_PORT=28765   CTRL_PORT=8766   TCP_PORT=61394
 #   ENABLE_LLM_CORRECT=false  LLM_CORRECT_MODEL=Qwen/Qwen2.5-0.5B-Instruct  # 默认关闭，以 Whisper 原文直出为准
 # ----------------------------------------------------------------------------
@@ -33,6 +34,8 @@ services:
     pid: host
 
     environment:
+      # 部署模式: all(默认双引擎) | ime/web_ime_only(纯手机输入法直发, 零GPU/零显存) | gpu/gpu_asr_only(纯GPU语音)
+      DEPLOY_MODE: ${DEPLOY_MODE:-all}
       # X11 显示与授权 (宿主机 :1 会话)
       DISPLAY: ${DISPLAY:-:1}
       XAUTHORITY: /root/.Xauthority
@@ -41,7 +44,7 @@ services:
       REDIR_PORT: ${REDIR_PORT:-28765}
       CTRL_PORT: ${CTRL_PORT:-8766}
       TCP_PORT: ${TCP_PORT:-61394}
-      # 本地 LLM 智能纠错 (默认 Qwen2.5-0.5B-Instruct, 可在 .env 中设为 Qwen/Qwen2.5-1.5B-Instruct 或 Qwen/Qwen3.5-0.8B)
+      # 本地 LLM 智能纠错 (默认 false；ime 模式自动禁用; 可在 .env 中设为 Qwen/Qwen2.5-1.5B-Instruct 或 Qwen/Qwen3.5-0.8B)
       ENABLE_LLM_CORRECT: ${ENABLE_LLM_CORRECT:-false}
       LLM_CORRECT_MODEL: ${LLM_CORRECT_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
       LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}

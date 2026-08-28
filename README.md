@@ -127,16 +127,34 @@ cd voice-input
 ## 🛠️ 一键运维命令参考 (`manage.sh`)
 
 ```bash
-./manage.sh status     # 查看综合运行看板 (容器状态、GPU 显存、各端点监听、纠错开关)
-./manage.sh url        # 打印所有手机端与电脑端连接 URL
-./manage.sh logs       # 实时跟踪 Whisper / LLM 转录日志
-./manage.sh restart    # 重启语音识别服务容器
-./manage.sh stop       # 停止语音识别容器
-./manage.sh start      # 构建并拉起容器服务
-./manage.sh certs      # 重新生成包含当前局域网 IP 的自签证书
+./manage.sh status            # 查看综合运行看板 (容器状态、GPU 显存、各端点监听、纠错开关；按 DEPLOY_MODE 差异化)
+./manage.sh status            # ime 模式下显示 0 显存轻量提示
+./manage.sh url               # 打印所有手机端与电脑端连接 URL
+./manage.sh logs              # 实时跟踪 Whisper / LLM 转录日志
+./manage.sh restart           # 重启语音识别服务容器 (保持当前 DEPLOY_MODE)
+./manage.sh stop              # 停止语音识别容器
+./manage.sh start             # 构建并拉起容器服务 (默认 DEPLOY_MODE=all 全功能)
+./manage.sh start ime         # 极轻量：纯手机输入法直发，<1s 启动，0 MB 显存
+./manage.sh start gpu         # 仅 GPU 语音
+./manage.sh start all         # 全功能双引擎
+./manage.sh certs             # 重新生成包含当前局域网 IP 的自签证书
 ```
 
 ---
+
+## 🔀 部署模式切换 (DEPLOY_MODE)
+
+本系统支持三种部署形态，按需选择零显存或全功能：
+
+| 模式值 `DEPLOY_MODE` | 启动命令 | 显存 | 启动速度 | 页面形态 | 适用场景 |
+| :--- | :--- | :---: | :---: | :--- | :--- |
+| `all` (默认) | `./manage.sh start all` | ~2GB | ~10s | 双引擎 Tab：GPU 语音 + 手机输入法直发 | 全功能，语音与直发皆要 |
+| `ime` / `web_ime_only` | `./manage.sh start ime` | **0 MB** | **<1s** | 仅 📱 手机输入法直传面板 + 快捷键栏 | 无 GPU / 只要手机输入法直发，极轻量 |
+| `gpu` / `gpu_asr_only` | `./manage.sh start gpu` | ~2GB | ~10s | 仅 🎙️ GPU 语音大按钮 | 只要 GPU 语音识别 |
+
+- `ime` 极轻量模式：**完全不加载 Whisper large-v3-turbo、不导入 PyTorch/CUDA、不加载 LLM 纠错**，内存仅 ~30MB，手机输入法直发与 `⌫ 删1字 / ⌫⌫ 删2字 / 🗑️ 清空 / ↵ 换行` 快捷键与 X11 智能粘贴（终端 Alt+V / GUI Ctrl+V）完全保留。
+- 也可直接用环境变量：`DEPLOY_MODE=ime docker compose up -d --build` 或在 `.env` 中写入 `DEPLOY_MODE=ime`。
+- `status` 看板会按当前模式差异化展示（ime 模式提示 0 显存与轻量说明）。
 
 ## ⚙️ 核心配置参数 (Environment Variables)
 
@@ -144,11 +162,12 @@ cd voice-input
 
 | 环境变量 | 默认值 | 作用说明 |
 | :--- | :---: | :--- |
-| `ENABLE_LLM_CORRECT` | `true` | 是否启用本地 Qwen2.5-0.5B 智能 ASR 纠错引擎（设为 `false` 可完全关闭） |
+| `DEPLOY_MODE` | `all` | 部署模式：`all`(全功能) / `ime`或`web_ime_only`(纯输入法直发零GPU) / `gpu`或`gpu_asr_only`(纯GPU语音) |
+| `ENABLE_LLM_CORRECT` | `false` | 是否启用本地 Qwen2.5-0.5B 智能 ASR 纠错（默认关闭，以 Whisper 原文直出为准；ime 模式自动禁用） |
 | `LLM_CORRECT_MODEL` | `Qwen/Qwen2.5-0.5B-Instruct` | 智能纠错使用的 HuggingFace 模型名称或本地路径 |
 | `WEB_PORT` | `28768` | 手机端 Web 麦克风网页与 WSS 实时流服务端口 (HTTPS + WSS 同端口) |
-| `CTRL_PORT` | `8766` | 宿主机/脚本调用的轻量控制 API 端口 (`/toggle`, `/status`, `/key`) |
-| `TCP_PORT` | `61394` | 供第三方开源 App (Otic / AMB) 直推原始 PCM 的 TCP 端口 |
+| `CTRL_PORT` | `8766` | 宿主机/脚本调用的轻量控制 API 端口 (`/toggle`, `/status`, `/key`, `/type`) |
+| `TCP_PORT` | `61394` | 供第三方开源 App (Otic / AMB) 直推原始 PCM 的 TCP 端口（ime 模式不监听） |
 | `TERMINAL_PASTE_KEY` | `alt+v` | 终端窗口使用的粘贴快捷键组合（可根据个人终端配置覆盖） |
 | `GUI_PASTE_KEY` | `ctrl+v` | Chrome、VS Code 等通用 GUI 应用使用的标准粘贴快捷键组合 |
 

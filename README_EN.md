@@ -106,16 +106,29 @@ cd voice-input
 
 ---
 
+## 🔀 Deployment Modes (DEPLOY_MODE)
+
+| Mode `DEPLOY_MODE` | Start command | VRAM | Boot | UI | Use case |
+| :--- | :--- | :---: | :---: | :--- | :--- |
+| `all` (default) | `./manage.sh start all` | ~2GB | ~10s | Dual tabs: GPU voice + phone IME | Full features |
+| `ime` / `web_ime_only` | `./manage.sh start ime` | **0 MB** | **<1s** | Phone IME panel + hotkeys only | No GPU / IME relay only, ultra-light |
+| `gpu` / `gpu_asr_only` | `./manage.sh start gpu` | ~2GB | ~10s | GPU voice button only | Voice only |
+
+In `ime` mode the container **skips Whisper, PyTorch/CUDA and LLM correction entirely** (~30MB RAM). IME relay and hotkeys (`⌫ Del 1 / ⌫⌫ Del 2 / 🗑️ Clear / ↵ Enter`) with smart X11 paste (Alt+V / Ctrl+V) remain fully functional. Set via `./manage.sh start ime` or `DEPLOY_MODE=ime docker compose up -d --build` or `.env`.
+
 ## 🛠️ Management CLI (`manage.sh`)
 
 ```bash
-./manage.sh status     # View full dashboard (health, VRAM, ports, LLM status)
-./manage.sh url        # Print mobile and PC connection URLs
-./manage.sh logs       # Live stream Whisper / LLM logs
-./manage.sh restart    # Restart service container
-./manage.sh stop       # Stop service container
-./manage.sh start      # Build and start container
-./manage.sh certs      # Regenerate SSL certificate with current LAN IP
+./manage.sh status        # Dashboard (adapted to DEPLOY_MODE; ime shows 0 VRAM hint)
+./manage.sh url           # Print mobile and PC connection URLs
+./manage.sh logs          # Live stream logs
+./manage.sh restart       # Restart container (keeps current DEPLOY_MODE)
+./manage.sh stop          # Stop container
+./manage.sh start         # Build and start (default DEPLOY_MODE=all)
+./manage.sh start ime     # Ultra-light: IME relay only, <1s boot, 0 MB VRAM
+./manage.sh start gpu     # GPU voice only
+./manage.sh start all     # Full dual-engine
+./manage.sh certs         # Regenerate SSL certificate with current LAN IP
 ```
 
 ---
