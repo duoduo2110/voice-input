@@ -1,0 +1,14 @@
+[Unit]
+Description=AudioRelay - Phone as Mic for Linux
+After=default.target
+Wants=pulseaudio.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+ExecStart=/data/audiorelay/bin/AudioRelay -minimized
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

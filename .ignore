@@ -1,0 +1,22 @@
+# ---------- 敏感与大文件 (ripgrep/IDE 索引忽略) ----------
+certs/*.pem
+certs/*.key
+certs/*.crt
+model/
+*.raw
+*.wav
+*.fifo
+*.log
+*.pid
+*.state
+__pycache__/
+*.pyc
+.DS_Store
+*.bak
+*.tmp
+
+# ---------- 工作区暂存 ----------
+# 忽略 .slim 但保留 .slim/deepwork/ 迁移记录
+.slim/*
+!.slim/deepwork/
+!.slim/deepwork/**

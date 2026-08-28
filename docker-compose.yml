@@ -1,0 +1,76 @@
+# docker-compose.yml — Whisper All-in-One 纯净容器 (方案 B)
+# ----------------------------------------------------------------------------
+# 彻底移除 PulseAudio 挂载: 音频 = WebSocket(TLS, 与 HTTPS 同端口 28768) /
+# TCP:61394 内存字节直推, 零声卡中转。WSS 与 HTTPS 页面同端口同证书,
+# 手机浏览器信任一次即可, 规避跨端口证书拦截。
+#
+# 默认在网络栈 host 模式下直接监听 (28768[HTTPS+WSS]/8766/28765/61394);
+# 也可按需改用 bridge + ports 映射放开这些端口。
+#
+# 启动:  docker compose -f /data/voice-input/docker-compose.yml up -d --build
+# 日志:  docker compose -f /data/voice-input/docker-compose.yml logs -f
+#
+# 可在 /data/voice-input/.env 中覆盖默认值:
+#   DISPLAY=:1
+#   XAUTHORITY_HOST=/run/user/1000/gdm/Xauthority   # 或 $XAUTHORITY / ~/.Xauthority
+#   HF_CACHE_HOST=/home/tt/.cache/huggingface
+#   WEB_PORT=28768   REDIR_PORT=28765   CTRL_PORT=8766   TCP_PORT=61394
+# ----------------------------------------------------------------------------
+name: voice-input
+
+services:
+  whisper-voice-all-in-one:
+    build: .
+    image: whisper-voice-all-in-one:latest
+    container_name: whisper-voice-all-in-one
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+    # host 网络: 直接绑定 28765/8766/28767/28768/61394;
+    # pid: host 使容器 PID 在宿主机命名空间可见, 便于直接信号调试。
+    network_mode: host
+    pid: host
+
+    environment:
+      # X11 显示与授权 (宿主机 :1 会话)
+      DISPLAY: ${DISPLAY:-:1}
+      XAUTHORITY: /root/.Xauthority
+      # 服务端口 (daemon 支持同名环境变量覆盖; WSS 与 HTTPS 共用 WEB_PORT)
+      WEB_PORT: ${WEB_PORT:-28768}
+      REDIR_PORT: ${REDIR_PORT:-28765}
+      CTRL_PORT: ${CTRL_PORT:-8766}
+      TCP_PORT: ${TCP_PORT:-61394}
+      # 粘贴组合键 (终端快捷键已改为 Alt+V; GUI 保持 Ctrl+V)
+      TERMINAL_PASTE_KEY: ${TERMINAL_PASTE_KEY:-alt+v}
+      GUI_PASTE_KEY: ${GUI_PASTE_KEY:-ctrl+v}
+      # pip nvidia wheel 的 CUDA 库路径
+      LD_LIBRARY_PATH: /usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib
+
+    volumes:
+      # X11 socket + 授权文件 (容器内 xclip/xdotool -> 宿主机活动窗口)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # 优先 GDM 会话 cookie (当前显示会话), 其次 ~/.Xauthority
+      - ${XAUTHORITY_HOST:-/run/user/1000/gdm/Xauthority}:/root/.Xauthority:ro
+      # 复用已缓存的 large-v3-turbo 模型 (~1.5GB)
+      - ${HF_CACHE_HOST:-/home/tt/.cache/huggingface}:/root/.cache/huggingface:rw
+      # 宿主机 <-> 容器共享 IPC (pid / state 文件)
+      - /tmp/whisper-ipc:/tmp/whisper-ipc:rw
+      # 自签证书 (HTTPS/WSS 麦克风授权, 含 IP SAN; 容器内置 openssl 自愈)
+      - ./certs:/app/certs:rw
+
+    # NVIDIA GPU 直通 (RTX 2080 Ti, 22GB)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # 健康检查: daemon 已写 pid 且进程存活, 且控制 API 可访问
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /tmp/whisper-ipc/whisper-dictation.pid && kill -0 $(cat /tmp/whisper-ipc/whisper-dictation.pid) 2>/dev/null && curl -fsS http://127.0.0.1:8766/healthz >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s

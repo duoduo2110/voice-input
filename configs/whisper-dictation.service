@@ -1,0 +1,16 @@
+[Unit]
+Description=Whisper GPU Voice Daemon (Large-v3-turbo on RTX 2080 Ti)
+After=pulseaudio.service
+Wants=pulseaudio.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+Environment=XAUTHORITY=/home/tt/.Xauthority
+Environment=LD_LIBRARY_PATH=/home/tt/.local/lib/python3.10/site-packages/nvidia/cublas/lib:/home/tt/.local/lib/python3.10/site-packages/nvidia/cudnn/lib
+ExecStart=/usr/bin/python3 /data/voice-input/whisper-daemon.py
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

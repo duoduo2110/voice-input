@@ -1,0 +1,12 @@
+[Unit]
+Description=Voice toggle HTTP trigger
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/voice-input/trigger-server.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

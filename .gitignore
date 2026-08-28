@@ -1,0 +1,28 @@
+# ---------- 敏感与大文件（私钥/证书） ----------
+certs/*.pem
+certs/*.key
+certs/*.crt
+
+# ---------- 本地模型缓存与音频 ----------
+model/
+*.raw
+*.wav
+*.fifo
+*.log
+*.pid
+*.state
+
+# ---------- Python / 工具 ----------
+__pycache__/
+*.pyc
+.DS_Store
+
+# ---------- 过渡临时文件 ----------
+*.bak
+*.tmp
+
+# ---------- 工作区暂存 ----------
+# .slim 全局忽略, 但《保留》 .slim/deepwork/ 迁移记录
+.slim/*
+!.slim/deepwork/
+!.slim/deepwork/**
