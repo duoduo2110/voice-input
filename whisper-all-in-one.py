@@ -310,6 +310,96 @@ def _key_from_request_path(req_path, req_body=b""):
     return k
 
 
+def _sanitize_text(s):
+    """清除代理对(surrogates)并保证为合法 UTF-8 字符串。"""
+    if not isinstance(s, str):
+        s = str(s)
+    # 代理对来自 websockets 的 ascii/surrogateescape 解码路径
+    try:
+        if any(0xD800 <= ord(c) <= 0xDFFF for c in s):
+            s = s.encode("ascii", "surrogateescape").decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    # 再次过滤残留代理对与非法字符
+    return s.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+
+def _decode_path_safe(p):
+    """对可能含代理对的请求路径做 UTF-8 还原。"""
+    try:
+        if isinstance(p, str) and any(0xD800 <= ord(c) <= 0xDFFF for c in p):
+            return p.encode("ascii", "surrogateescape").decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return p
+
+
+def _type_text_from_request(req_path, req_body=b""):
+    """从 GET(?t=.. / ?text=..) 或 POST JSON({text/t}) / form 中提取待打字文本。
+    兼容 websockets 的 surrogateescape 路径与各种客户端编码。"""
+    # 路径先做代理对还原，避免中文直传 URL 未编码时出现乱码/异常
+    safe_path = _decode_path_safe(req_path or "")
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(safe_path).query)
+        t = (qs.get("t") or qs.get("text") or [""])[0]
+        if t:
+            return _sanitize_text(str(t))
+    except Exception:
+        pass
+    if req_body:
+        # 尝试 UTF-8 解码 body (含代理对还原)
+        body_str = ""
+        try:
+            if isinstance(req_body, (bytes, bytearray)):
+                # 若 body 来自 surrogate 路径也可能含代理对
+                body_str = req_body.decode("utf-8", errors="replace")
+            else:
+                body_str = str(req_body)
+        except Exception:
+            body_str = ""
+        # JSON 优先
+        try:
+            data = json.loads(body_str if body_str else req_body)
+            if isinstance(data, dict):
+                txt = data.get("text")
+                if txt is None:
+                    txt = data.get("t")
+                if txt is not None and str(txt) != "":
+                    return _sanitize_text(str(txt))
+        except Exception:
+            pass
+        # form urlencode 兼容
+        try:
+            qs2 = urllib.parse.parse_qs(body_str)
+            t2 = (qs2.get("t") or qs2.get("text") or [""])[0]
+            if t2:
+                return _sanitize_text(str(t2))
+        except Exception:
+            pass
+        # 纯文本 body 兜底
+        try:
+            s = body_str.strip()
+            if s and not s.startswith("{") and not s.startswith("<"):
+                if len(s) < 8192:
+                    return _sanitize_text(s)
+        except Exception:
+            pass
+    return ""
+
+
+def _type_response_payload(text):
+    """调用 type_via_clipboard 并生成统一返回体(全链路代理对清洗)。"""
+    t = _sanitize_text(str(text or ""))
+    if t:
+        try:
+            type_via_clipboard(t)
+        except Exception as e:
+            print(f"[AllInOne] /type 注入异常: {e}", flush=True)
+    # preview 同样清洗，避免 json 编码再次触发 surrogate 异常
+    preview = _sanitize_text(t[:20])
+    return {"ok": bool(t), "len": len(t), "preview": preview}
+
+
 # ---------------------------------------------------------------------------
 # 录音会话 (内存 bytearray, 零声卡)
 # ---------------------------------------------------------------------------
@@ -486,6 +576,15 @@ async def ws_handler(ws):
                     cmd = data.get("cmd")
                     if cmd == "stop":
                         break
+                    if cmd == "type":
+                        txt = str(data.get("text") or data.get("t") or "")
+                        res = _type_response_payload(txt)
+                        try:
+                            await ws.send(json.dumps(
+                                {"status": "TYPE", **res}))
+                        except Exception:
+                            pass
+                        continue
                     if cmd == "key":
                         ok, msg = dispatch_key(data.get("action") or "")
                         try:
@@ -520,8 +619,19 @@ def _http_response(status, ctype, body):
 async def http_process_request(connection, request):
     """同一 TLS 端口上的 HTTP/WS 路由:
     /stream 且携带 Upgrade: websocket -> 返回 None 交给 WebSocket handler;
-    其余路径在 HTTP 层直接应答(页面 / toggle / status / healthz / key)。"""
-    raw = request.path or "/"
+    其余路径在 HTTP 层直接应答(页面 / toggle / status / healthz / key / type)。
+    注意: websockets 16 的 Request.parse 仅允许 GET, 故 POST /type 在此层
+    无法落入 process_request; 前端对此端口的 POST 会走 WSS->HTTP 异常路径,
+    需在前端优先走 WSS cmd:type 或 HTTP 8766 端口。"""
+    raw = _decode_path_safe(request.path or "/")
+    # 请求体(若存在) 从 connection 层面无法直接读取; websockets 的握手层
+    # 对非 0 Content-Length 会直接抛错, 故此处仅处理 GET 形态的 /type
+    body = b""
+    try:
+        # 部分 websockets 版本会把原始 body bytes 暴露在 request 上
+        body = getattr(request, "body", b"") or b""
+    except Exception:
+        body = b""
     path = urllib.parse.urlsplit(raw).path
     if (request.headers.get("Upgrade") or "").lower() == "websocket":
         if path == "/stream":
@@ -546,6 +656,18 @@ async def http_process_request(connection, request):
                               "application/json; charset=utf-8",
                               json.dumps({"ok": ok, "action": msg},
                                          ensure_ascii=False).encode("utf-8"))
+    if path in ("/type", "/api/type"):
+        txt = _type_text_from_request(raw, body)
+        payload = _type_response_payload(txt)
+        try:
+            body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            # 兜底: 避免代理对再次导致 500
+            safe = {k: (_sanitize_text(v) if isinstance(v, str) else v) for k, v in payload.items()}
+            body_bytes = json.dumps(safe, ensure_ascii=False).encode("utf-8", errors="replace")
+        return _http_response(200 if payload.get("ok") else 400,
+                              "application/json; charset=utf-8",
+                              body_bytes)
     if path == "/corrector":
         on = (urllib.parse.parse_qs(urllib.parse.urlsplit(raw).query).get("on") or [""])[0]
         if on in ("1", "true", "on"):
@@ -731,6 +853,55 @@ h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135de
   background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-color:transparent;
   box-shadow:0 8px 22px -6px rgba(124,155,255,.55),inset 0 1px 1px rgba(255,255,255,.4);
 }
+/* 双引擎主 Tab 胶囊 */
+.engines{display:flex;gap:10px;justify-content:center;margin:16px 0 0;flex-shrink:0}
+.engines button{
+  flex:1;max-width:210px;padding:11px 10px;border-radius:999px;font-size:13.5px;font-weight:700;letter-spacing:.3px;cursor:pointer;
+  border:1px solid var(--stroke);background:var(--glass);color:var(--muted);
+  -webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);
+  transition:transform .1s,background .22s,color .22s,border-color .22s,box-shadow .22s;
+}
+.engines button:active{transform:scale(.96)}
+.engines button.active{
+  background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-color:transparent;
+  box-shadow:0 8px 22px -6px rgba(124,155,255,.55),inset 0 1px 1px rgba(255,255,255,.4);
+}
+.panel{display:flex;flex-direction:column;flex:1;min-height:0}
+.panel[hidden]{display:none !important}
+/* 手机直发面板 */
+.phone-card{display:flex;flex-direction:column;gap:12px;margin-top:14px}
+#phoneText{
+  width:100%;min-height:132px;max-height:38vh;resize:none;overflow-y:auto;
+  background:linear-gradient(160deg,rgba(255,255,255,.10),rgba(255,255,255,.04));
+  border:1px solid rgba(255,255,255,.16);border-radius:18px;color:var(--fg);
+  font-size:16px;line-height:1.65;padding:14px 14px;outline:none;
+  -webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);
+  transition:border-color .2s,box-shadow .2s;
+}
+#phoneText::placeholder{color:rgba(238,241,251,.45)}
+#phoneText:focus{border-color:rgba(124,155,255,.55);box-shadow:0 0 0 3px rgba(124,155,255,.18)}
+.phone-meta{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted);padding:0 2px}
+.phone-opts{display:flex;gap:8px;flex-wrap:wrap}
+.phone-opts label{
+  display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;
+  background:var(--glass);border:1px solid var(--stroke);border-radius:999px;padding:7px 10px;
+  -webkit-user-select:none;user-select:none;transition:background .15s,border-color .15s,color .15s;
+}
+.phone-opts label:has(input:checked){background:rgba(124,155,255,.18);border-color:rgba(124,155,255,.38);color:#d8e0ff}
+.phone-opts input{accent-color:#7c9bff;width:14px;height:14px}
+.phone-send{
+  width:100%;padding:18px 14px;border-radius:20px;border:1px solid rgba(255,255,255,.18);cursor:pointer;
+  font-size:18px;font-weight:800;letter-spacing:.6px;color:#fff;
+  background:
+    radial-gradient(130% 130% at 30% 22%,rgba(255,255,255,.30),rgba(255,255,255,0) 60%),
+    linear-gradient(135deg,#4facfe 0%,#7c9bff 45%,#a86bff 100%);
+  box-shadow:0 18px 36px -12px rgba(124,155,255,.55),0 8px 18px -6px rgba(0,0,0,.35),inset 0 1px 1px rgba(255,255,255,.4);
+  transition:transform .08s,box-shadow .18s,filter .18s;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+}
+.phone-send:active{transform:scale(.97);filter:brightness(1.05)}
+.phone-send:disabled{opacity:.45;cursor:not-allowed;transform:none;filter:grayscale(.2)}
+.phone-hint{font-size:11.5px;color:var(--muted);text-align:center;line-height:1.6}
 .guide{
   font-size:14px;line-height:1.7;margin-top:16px;color:var(--muted);background:var(--glass);
   border:1px solid var(--stroke);border-radius:16px;padding:12px 16px;text-align:center;white-space:pre-wrap;
@@ -822,22 +993,42 @@ h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135de
   </header>
   <div id="banner" hidden role="alert"></div>
   <div id="status">正在检测环境…</div>
-  <div class="modes">
-    <button id="mTap" type="button">点击说话</button>
-    <button id="mHold" type="button">按住说话</button>
+  <div class="engines">
+    <button id="eGpu" type="button" class="active">🎙️ GPU 语音输入</button>
+    <button id="ePhone" type="button">📱 手机输入法直发</button>
   </div>
-  <div id="guide" class="guide">👉 请点击下方【🎙 说话】大按钮，浏览器将弹出系统录音权限确认框，请选择【允许】</div>
-  <main class="thumb">
-    <div class="orb" id="orb">
-      <span class="ring"></span><span class="ring"></span><span class="ring"></span>
-      <button id="talk" class="big"><em>🎙</em><small>说话</small></button>
+  <!-- 模式 1: GPU 语音 -->
+  <div id="panelGpu" class="panel">
+    <div class="modes">
+      <button id="mTap" type="button">点击说话</button>
+      <button id="mHold" type="button">按住说话</button>
     </div>
-  </main>
-  <div class="keys" id="keys">
-    <button id="kDel1"  type="button" aria-label="删除1字"><b>⌫</b><small>删1字</small></button>
-    <button id="kDel2"  type="button" aria-label="删除2字"><b>⌫⌫</b><small>删2字</small></button>
-    <button id="kClear" type="button" aria-label="清空输入框"><b>🗑️</b><small>清空</small></button>
-    <button id="kEnter" type="button" aria-label="换行"><b>↵</b><small>换行</small></button>
+    <div id="guide" class="guide">👉 请点击下方【🎙 说话】大按钮，浏览器将弹出系统录音权限确认框，请选择【允许】</div>
+    <main class="thumb">
+      <div class="orb" id="orb">
+        <span class="ring"></span><span class="ring"></span><span class="ring"></span>
+        <button id="talk" class="big"><em>🎙</em><small>说话</small></button>
+      </div>
+    </main>
+    <div class="keys" id="keys">
+      <button id="kDel1"  type="button" aria-label="删除1字"><b>⌫</b><small>删1字</small></button>
+      <button id="kDel2"  type="button" aria-label="删除2字"><b>⌫⌫</b><small>删2字</small></button>
+      <button id="kClear" type="button" aria-label="清空输入框"><b>🗑️</b><small>清空</small></button>
+      <button id="kEnter" type="button" aria-label="换行"><b>↵</b><small>换行</small></button>
+    </div>
+  </div>
+  <!-- 模式 2: 手机输入法直发 -->
+  <div id="panelPhone" class="panel" hidden>
+    <div class="phone-card">
+      <textarea id="phoneText" placeholder="在此用手机输入法语音/手写/键盘输入，长文本亦可粘贴…&#10;支持讯飞/搜狗/微信键盘/iOS听写任意输入法" rows="5" enterkeyhint="send" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+      <div class="phone-meta"><span id="phoneCount">0 字</span><span id="phoneTip"></span></div>
+      <div class="phone-opts">
+        <label><input id="optAutoClear" type="checkbox" checked> 发送后自动清空</label>
+        <label><input id="optEnterSend" type="checkbox"> 按换行即发送</label>
+      </div>
+      <button id="phoneSend" class="phone-send" type="button">🚀 发送至电脑</button>
+      <div class="phone-hint">超大拇指按钮 · 轻点即毫秒级打字到电脑光标处 · 可连续发送</div>
+    </div>
   </div>
 </div>
 <script>
@@ -1162,6 +1353,143 @@ $("corrToggle").onclick = () => {
 };
 updateCorrUI();
 
+/* ---------- 双引擎胶囊切换 (状态互不干扰) ---------- */
+const panelGpu = $("panelGpu"), panelPhone = $("panelPhone");
+const eGpu = $("eGpu"), ePhone = $("ePhone");
+let engine = (localStorage.getItem("whisper_engine") || "gpu");
+function setEngine(which){
+  engine = which;
+  const isGpu = which === "gpu";
+  eGpu.classList.toggle("active", isGpu);
+  ePhone.classList.toggle("active", !isGpu);
+  panelGpu.hidden = !isGpu;
+  panelPhone.hidden = isGpu;
+  try{ localStorage.setItem("whisper_engine", which); }catch(_){}
+  if (!isGpu) setTimeout(()=>{ try{ $("phoneText").focus(); }catch(_){} }, 80);
+}
+eGpu.onclick = () => { buzz(); setEngine("gpu"); };
+ePhone.onclick = () => { buzz(); setEngine("phone"); };
+setEngine(engine);
+
+/* ---------- 手机输入法直发面板 ---------- */
+const phoneText = $("phoneText"), phoneSend = $("phoneSend");
+const phoneCount = $("phoneCount"), phoneTip = $("phoneTip");
+const optAutoClear = $("optAutoClear"), optEnterSend = $("optEnterSend");
+
+function refreshPhoneMeta(){
+  const n = (phoneText.value || "").length;
+  phoneCount.textContent = n + " 字";
+  phoneSend.disabled = n === 0;
+  // 自适应高度: 最小 132px, 随内容增长
+  phoneText.style.height = "auto";
+  const nh = Math.min(Math.max(phoneText.scrollHeight, 132), Math.floor(window.innerHeight * 0.38));
+  phoneText.style.height = nh + "px";
+}
+phoneText.addEventListener("input", refreshPhoneMeta);
+phoneText.addEventListener("focus", refreshPhoneMeta);
+window.addEventListener("resize", refreshPhoneMeta);
+refreshPhoneMeta();
+
+function phoneVibrateOk(){
+  if (!navigator.vibrate) return;
+  try{ navigator.vibrate([18, 30, 18]); }catch(_){}
+}
+function phoneVibrateErr(){
+  if (!navigator.vibrate) return;
+  try{ navigator.vibrate([40, 30, 40]); }catch(_){}
+}
+
+async function sendPhoneText(){
+  const text = (phoneText.value || "").trimEnd();
+  // 允许纯空格? 这里要求非空
+  if (!text.trim()){ phoneTip.textContent = "请输入内容"; phoneVibrateErr(); setTimeout(()=> phoneTip.textContent="", 1400); return; }
+  phoneSend.disabled = true;
+  phoneTip.textContent = "发送中…";
+  let ok = false, len = text.length, preview = text.slice(0,20);
+  // 优先走已建立的 WSS (毫秒级), 否则 HTTP
+  let via = "";
+  try{
+    if (ws && ws.readyState === 1){
+      // 通过 WebSocket 直发
+      const p = new Promise((resolve, reject)=>{
+        const timer = setTimeout(()=> reject(new Error("ws timeout")), 2200);
+        function onMsg(ev){
+          try{
+            const j = JSON.parse(ev.data);
+            if (j.status === "TYPE"){
+              clearTimeout(timer);
+              ws.removeEventListener("message", onMsg);
+              resolve(j);
+            }
+          }catch(_){}
+        }
+        ws.addEventListener("message", onMsg);
+        try{ ws.send(JSON.stringify({cmd:"type", text})); }catch(e){ clearTimeout(timer); ws.removeEventListener("message", onMsg); reject(e); }
+      });
+      const j = await p;
+      ok = !!j.ok; len = j.len ?? len; preview = j.preview ?? preview; via = "WSS";
+    } else {
+      throw new Error("no ws");
+    }
+  }catch(_){
+    // HTTP 直发 (POST JSON, 兼容 28768 仅 GET 的限制 -> 回退到 8766)
+    via = "HTTP";
+    const httpUrl = httpTypeFallbackUrl();
+    const httpGetUrl = (httpUrl === "/api/type") ? ("/api/type?t=" + encodeURIComponent(text)) : (httpUrl + "?t=" + encodeURIComponent(text));
+    try{
+      const r = await fetch(httpUrl, {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({text}),
+        cache: "no-store"
+      });
+      const j = await r.json();
+      ok = !!j.ok; len = j.len ?? len; preview = j.preview ?? preview;
+    }catch(e){
+      // GET 兜底 (兼容极旧 WebView / 28768 场景)
+      try{
+        const r2 = await fetch(httpGetUrl, {cache:"no-store"});
+        const j2 = await r2.json();
+        ok = !!j2.ok; len = j2.len ?? len; preview = j2.preview ?? preview;
+      }catch(_2){
+        ok = false;
+      }
+    }
+  }
+  if (ok){
+    phoneVibrateOk();
+    phoneTip.textContent = "✓ 已发送 " + len + " 字 (" + via + ") · " + preview;
+    if (optAutoClear.checked){ phoneText.value = ""; refreshPhoneMeta(); }
+  } else {
+    phoneVibrateErr();
+    phoneTip.textContent = "✗ 发送失败";
+  }
+  setTimeout(()=>{ phoneTip.textContent=""; refreshPhoneMeta(); }, 1800);
+  refreshPhoneMeta();
+}
+phoneSend.addEventListener("click", (e)=>{ e.preventDefault(); buzz(); sendPhoneText(); });
+phoneSend.addEventListener("touchstart", ()=>{ try{ phoneSend.style.transform="scale(.97)"; }catch(_){} }, {passive:true});
+phoneSend.addEventListener("touchend", ()=>{ try{ phoneSend.style.transform=""; }catch(_){} }, {passive:true});
+phoneText.addEventListener("keydown", (e)=>{
+  if (optEnterSend.checked && e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing){
+    e.preventDefault();
+    sendPhoneText();
+  }
+});
+
+/* 28768 HTTPS POST 限制说明: websockets 仅支持 GET 握手, 该端口 POST 会被协议层拒绝;
+   故 sendPhoneText 优先走 WSS, 失败则回退到当前 origin 的 /api/type(若为 8766)或显式 8766 端口。
+   此处做一个轻量探测: 若当前 location.port 为 28768/28765, 则 HTTP 回退走显式 8766。 */
+function httpTypeFallbackUrl(){
+  const h = location.hostname || "127.0.0.1";
+  // 若已在 8766, 直接同源; 否则显式指向 8766
+  if (String(location.port) === "8766") return "/api/type";
+  return "http://" + h + ":8766/api/type";
+}
+
+/* 对外暴露小工具: 快捷键面板也可一键把输入框内容发送 */
+window.__sendPhoneText = sendPhoneText;
+
 async function pollStatus(){
   try {
     const r = await fetch("/status", { cache: "no-store" });
@@ -1194,6 +1522,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Cache-Control", "no-store")
         if extra:
             for k, v in extra.items():
@@ -1201,7 +1531,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _json(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        # 代理对清洗, 避免 json 编码 surrogate 异常
+        try:
+            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            safe = {}
+            for k, v in (obj.items() if isinstance(obj, dict) else []):
+                if isinstance(v, str):
+                    v = _sanitize_text(v)
+                safe[k] = v
+            body = json.dumps(safe if safe else obj, ensure_ascii=False).encode("utf-8", errors="replace")
         self._headers(code, "application/json; charset=utf-8", len(body))
         self.wfile.write(body)
 
@@ -1226,6 +1565,11 @@ class Handler(BaseHTTPRequestHandler):
         ok, msg = dispatch_key(k)
         self._json({"ok": ok, "action": msg}, 200 if ok else 400)
 
+    def _do_type(self):
+        txt = _type_text_from_request(self.path, self._read_body())
+        payload = _type_response_payload(txt)
+        self._json(payload, 200 if payload.get("ok") else 400)
+
     def _do_corrector(self):
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         on = (qs.get("on") or [""])[0]
@@ -1245,7 +1589,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         mode = getattr(self.server, "mode", "api")
-        path = self.path.split("?", 1)[0]
+        # 路径需代理对还原, 否则中文 URL 会触发后续 json/日志的 surrogate 异常
+        path = _decode_path_safe(self.path or "/").split("?", 1)[0]
         try:
             if mode == "redirect":
                 host = self.headers.get("Host", "localhost").split(":")[0] or "localhost"
@@ -1260,10 +1605,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._text("ok")
                 elif path in ("/key", "/api/key"):
                     self._do_key()
+                elif path in ("/type", "/api/type"):
+                    self._do_type()
                 elif path == "/corrector":
                     self._do_corrector()
                 elif path == "/":
-                    self._text("whisper-all-in-one control API: /toggle /status /healthz /key /corrector")
+                    self._text("whisper-all-in-one control API: /toggle /status /healthz /key /type /corrector")
                 else:
                     self._text("not found", 404)
         except BrokenPipeError:
@@ -1274,11 +1621,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def do_OPTIONS(self):
+        # CORS 预检
+        self._headers(204, "text/plain; charset=utf-8", 0)
+        try:
+            self.wfile.write(b"")
+        except Exception:
+            pass
+
     def do_POST(self):
-        path = self.path.split("?", 1)[0]
+        path = _decode_path_safe(self.path or "/").split("?", 1)[0]
         try:
             if path in ("/key", "/api/key"):
                 self._do_key()
+            elif path in ("/type", "/api/type"):
+                self._do_type()
             elif path == "/corrector":
                 self._do_corrector()
             elif path == "/toggle":
