@@ -24,9 +24,14 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:/u
 #   - X11 注入: xdotool / xclip / libx11-6 / libxext6
 #   - 运行支撑: libgomp1 (ctranslate2 OpenMP)、libportaudio2 (sounddevice
 #               PortAudio 运行时)、openssl (证书自愈)、curl (健康检查)
+#   - 编译支撑: gcc / g++ / build-essential / python3-dev (Triton / PyTorch JIT 必需)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
+        python3-dev \
+        gcc \
+        g++ \
+        build-essential \
         xdotool \
         xclip \
         libx11-6 \
@@ -39,17 +44,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python 包: faster-whisper + WSS 服务 + 音频/数值 + CUDA 加速库
+# + 本地 LLM 智能纠错 (transformers + torch, CUDA 12.x 捆绑)
 RUN pip3 install --no-cache-dir \
         faster-whisper \
         websockets \
         sounddevice \
         numpy \
         nvidia-cublas-cu12 \
-        nvidia-cudnn-cu12
+        nvidia-cudnn-cu12 \
+        torch \
+        transformers \
+        accelerate \
+        safetensors
 
 WORKDIR /app
 
-# All-in-One 守护进程 (HTTPS 8768 / WSS 8767 / HTTP 8766 / TCP 61394 / 跳转 8765)
+# All-in-One 守护进程 (HTTPS 28768 / WSS 同端口 / HTTP 8766 / TCP 61394 / 跳转 28765)
 COPY whisper-all-in-one.py /app/whisper-all-in-one.py
+# LLM ASR 智能纠错引擎 (Qwen2.5-0.5B-Instruct, CUDA fp16)
+COPY corrector.py /app/corrector.py
 
 CMD ["python3", "/app/whisper-all-in-one.py"]

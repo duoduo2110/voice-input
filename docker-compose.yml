@@ -15,6 +15,7 @@
 #   XAUTHORITY_HOST=/run/user/1000/gdm/Xauthority   # 或 $XAUTHORITY / ~/.Xauthority
 #   HF_CACHE_HOST=/home/tt/.cache/huggingface
 #   WEB_PORT=28768   REDIR_PORT=28765   CTRL_PORT=8766   TCP_PORT=61394
+#   ENABLE_LLM_CORRECT=true   LLM_CORRECT_MODEL=Qwen/Qwen2.5-0.5B-Instruct
 # ----------------------------------------------------------------------------
 name: voice-input
 
@@ -40,6 +41,9 @@ services:
       REDIR_PORT: ${REDIR_PORT:-28765}
       CTRL_PORT: ${CTRL_PORT:-8766}
       TCP_PORT: ${TCP_PORT:-61394}
+      # 本地 LLM 智能纠错 (Qwen2.5-0.5B-Instruct, CUDA fp16, ~1GB 显存)
+      ENABLE_LLM_CORRECT: ${ENABLE_LLM_CORRECT:-true}
+      LLM_CORRECT_MODEL: ${LLM_CORRECT_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
       # 粘贴组合键 (终端快捷键已改为 Alt+V; GUI 保持 Ctrl+V)
       TERMINAL_PASTE_KEY: ${TERMINAL_PASTE_KEY:-alt+v}
       GUI_PASTE_KEY: ${GUI_PASTE_KEY:-ctrl+v}

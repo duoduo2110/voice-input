@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -82,6 +83,25 @@ print(f"[AllInOne] XAUTHORITY={os.environ.get('XAUTHORITY', 'NOT SET')}", flush=
 print(f"[AllInOne] 正在加载 {MODEL_NAME} (CUDA float16) ...", flush=True)
 MODEL = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
 print(f"[AllInOne] {MODEL_NAME} 加载完成。", flush=True)
+
+# ---------------------------------------------------------------------------
+# 本地轻量 LLM 智能纠错引擎 (Qwen2.5-0.5B-Instruct, CUDA fp16 ~1GB)
+# 可用环境变量 ENABLE_LLM_CORRECT=false 关闭; 异常时自动回退原始 ASR 文本
+# ---------------------------------------------------------------------------
+CORRECTOR = None
+try:
+    from corrector import ASRCorrector
+    CORRECTOR = ASRCorrector()
+except Exception as e:
+    print(f"[AllInOne] 智能纠错引擎不可用: {e}", flush=True)
+    CORRECTOR = None
+
+
+def set_corrector_enabled(on):
+    """运行时开关 LLM 纠错; 返回实际生效状态。"""
+    if CORRECTOR is not None:
+        return CORRECTOR.set_enabled(on)
+    return False
 
 # ---------------------------------------------------------------------------
 # 全局状态
@@ -235,6 +255,62 @@ def type_via_clipboard(text):
 
 
 # ---------------------------------------------------------------------------
+# 快捷按键分发 (严格白名单, 拒绝任意命令注入)
+# ---------------------------------------------------------------------------
+# 仅允许以下动作; 每个动作映射到硬编码的 xdotool 参数列表, 不接受任意输入
+KEY_ACTIONS = ("backspace1", "backspace2", "clear", "enter")
+
+
+def _send_keys(combo, env):
+    subprocess.run(["xdotool", "key", "--clearmodifiers", "--delay", "20", *combo],
+                   check=False, env=env)
+
+
+def dispatch_key(action):
+    """按白名单动作向当前活动窗口发送按键。返回 (ok, message)。
+    - backspace1/2: 删除 1/2 个字符 (BackSpace)
+    - clear: 清空输入框 (终端 -> ctrl+c 中断行输入; GUI -> ctrl+a 全选后删除)
+    - enter: 发送回车 (Return)
+    非白名单动作一律拒绝, 绝不将用户输入拼接进 xdotool 命令。"""
+    if action not in KEY_ACTIONS:
+        return False, f"forbidden action: {action!r}"
+    env = get_env()
+    wm = _active_window_info(env)
+    try:
+        if action == "backspace1":
+            _send_keys(["BackSpace"], env)
+        elif action == "backspace2":
+            _send_keys(["BackSpace", "BackSpace"], env)
+        elif action == "enter":
+            _send_keys(["Return"], env)
+        elif action == "clear":
+            if any(t in wm for t in TERMINAL_HINTS):
+                _send_keys(["ctrl+c"], env)               # 终端: 中断/清行
+            else:
+                _send_keys(["ctrl+a", "BackSpace"], env)  # GUI: 全选后删除
+        print(f"[AllInOne] key action: {action} -> {wm or '(unknown window)'}", flush=True)
+        return True, action
+    except Exception as e:
+        print(f"[AllInOne] key action 失败: {e}", flush=True)
+        return False, str(e)
+
+
+def _key_from_request_path(req_path, req_body=b""):
+    """从请求路径(?k=..)与可选 body(JSON/form)中解析按键动作; 缺失/非法返回 ''。"""
+    qs = urllib.parse.parse_qs(urllib.parse.urlsplit(req_path).query)
+    k = (qs.get("k") or [""])[0]
+    if k:
+        return k
+    if req_body:
+        try:
+            data = json.loads(req_body)
+            k = data.get("k") or data.get("action") or ""
+        except Exception:
+            pass
+    return k
+
+
+# ---------------------------------------------------------------------------
 # 录音会话 (内存 bytearray, 零声卡)
 # ---------------------------------------------------------------------------
 def begin_recording(source):
@@ -302,7 +378,10 @@ def _transcribe_worker(raw, src):
         print(f"[AllInOne] 转录完成 {elapsed:.1f}ms ({len(raw)}B, 来源={src}) -> {text!r}",
               flush=True)
         if text:
-            type_via_clipboard(text)
+            out_text = text
+            if CORRECTOR is not None and CORRECTOR.enabled:
+                out_text = CORRECTOR.correct(text)
+            type_via_clipboard(out_text)
             send_notify("✔ 已输出", expire_ms=400)
     except Exception as e:
         print(f"[AllInOne] 转录出错: {e}", flush=True)
@@ -404,8 +483,16 @@ async def ws_handler(ws):
                         data = json.loads(msg)
                     except Exception:
                         data = {"cmd": str(msg)}
-                    if data.get("cmd") == "stop":
+                    cmd = data.get("cmd")
+                    if cmd == "stop":
                         break
+                    if cmd == "key":
+                        ok, msg = dispatch_key(data.get("action") or "")
+                        try:
+                            await ws.send(json.dumps(
+                                {"status": "KEY", "ok": ok, "action": msg}))
+                        except Exception:
+                            pass
         except ConnectionClosed:
             pass
     finally:
@@ -433,8 +520,9 @@ def _http_response(status, ctype, body):
 async def http_process_request(connection, request):
     """同一 TLS 端口上的 HTTP/WS 路由:
     /stream 且携带 Upgrade: websocket -> 返回 None 交给 WebSocket handler;
-    其余路径在 HTTP 层直接应答(页面 / toggle / status / healthz)。"""
-    path = request.path or "/"
+    其余路径在 HTTP 层直接应答(页面 / toggle / status / healthz / key)。"""
+    raw = request.path or "/"
+    path = urllib.parse.urlsplit(raw).path
     if (request.headers.get("Upgrade") or "").lower() == "websocket":
         if path == "/stream":
             return None                       # 转交 WebSocket handler
@@ -451,6 +539,24 @@ async def http_process_request(connection, request):
                               json.dumps(status_payload(), ensure_ascii=False).encode("utf-8"))
     if path == "/healthz":
         return _http_response(200, "text/plain; charset=utf-8", b"ok")
+    if path in ("/key", "/api/key"):
+        k = _key_from_request_path(raw, getattr(request, "body", b""))
+        ok, msg = dispatch_key(k)
+        return _http_response(200 if ok else 400,
+                              "application/json; charset=utf-8",
+                              json.dumps({"ok": ok, "action": msg},
+                                         ensure_ascii=False).encode("utf-8"))
+    if path == "/corrector":
+        on = (urllib.parse.parse_qs(urllib.parse.urlsplit(raw).query).get("on") or [""])[0]
+        if on in ("1", "true", "on"):
+            set_corrector_enabled(True)
+        elif on in ("0", "false", "off"):
+            set_corrector_enabled(False)
+        return _http_response(200, "application/json; charset=utf-8",
+                              json.dumps({"ok": True,
+                                          "llm_correct": bool(CORRECTOR is not None
+                                                              and CORRECTOR.enabled)},
+                                         ensure_ascii=False).encode("utf-8"))
     return _http_response(404, "text/plain; charset=utf-8", b"not found")
 
 
@@ -532,6 +638,8 @@ def status_payload():
             "pid": os.getpid(),
             "uptime_s": int(time.time() - START_TIME),
             "model": MODEL_NAME,
+            "llm_correct": bool(CORRECTOR is not None and CORRECTOR.enabled),
+            "llm_model": (CORRECTOR.model_name if CORRECTOR else ""),
 "ports": {"web": WEB_PORT, "wss": WEB_PORT,   # WSS 与 HTTPS 同端口(28768)
           "ctrl": CTRL_PORT, "tcp": TCP_PORT,
           "redirect": REDIR_PORT},
@@ -589,6 +697,18 @@ body::after{
 }
 .stage{flex:1;display:flex;flex-direction:column;width:100%;max-width:440px;margin:0 auto}
 header{text-align:center;flex-shrink:0}
+.stage header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.stage header .ttl{flex:1;min-width:0}
+#corrToggle{
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  background:linear-gradient(160deg,rgba(83,232,139,.20),rgba(83,232,139,.05));
+  border:1px solid rgba(83,232,139,.38);color:#b7f5cd;border-radius:999px;
+  font-size:12px;padding:7px 12px;cursor:pointer;flex-shrink:0;margin-top:2px;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  transition:transform .06s,background .15s;
+}
+#corrToggle.off{background:linear-gradient(160deg,rgba(255,255,255,.10),rgba(255,255,255,.03));border-color:rgba(255,255,255,.16);color:var(--muted)}
+#corrToggle:active{transform:scale(.92)}
 h1{font-size:20px;font-weight:700;letter-spacing:.6px;display:flex;align-items:center;justify-content:center;gap:9px}
 h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135deg,#53e88b,#2fb968);box-shadow:0 0 8px rgba(83,232,139,.85);animation:hb 2.4s ease-in-out infinite}
 @keyframes hb{50%{opacity:.35}}
@@ -661,13 +781,44 @@ h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135de
   animation:breathe 1.5s ease-in-out infinite;
 }
 @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+/* ---------- 快捷编辑工具栏 (毛玻璃 + 动态触感涟漪特效) ---------- */
+.keys{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:16px}
+.keys button{
+  position:relative;overflow:hidden;
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  background:linear-gradient(160deg,rgba(255,255,255,.10),rgba(255,255,255,.03));
+  border:1px solid rgba(255,255,255,.16);border-radius:14px;color:var(--fg);
+  font-size:11px;padding:9px 2px;cursor:pointer;line-height:1.3;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  transition:transform .08s cubic-bezier(.34,1.56,.64,1),background .15s ease,box-shadow .15s ease,border-color .15s ease;
+}
+.keys button b{display:block;font-size:17px;font-weight:600;margin-bottom:1px;pointer-events:none}
+.keys button small{display:block;color:var(--muted);font-size:10px;pointer-events:none}
+.keys button:active{
+  transform:scale(.88);
+  background:rgba(255,255,255,.22);
+  border-color:rgba(255,255,255,.45);
+  box-shadow:0 0 15px rgba(255,255,255,.25);
+}
+.keys button .ripple{
+  position:absolute;border-radius:50%;
+  background:radial-gradient(circle,rgba(255,255,255,.6) 0%,rgba(124,155,255,.3) 60%,transparent 100%);
+  transform:scale(0);animation:keyRipple .35s ease-out;pointer-events:none;
+}
+@keyframes keyRipple{
+  0%{transform:scale(0);opacity:1}
+  100%{transform:scale(2.5);opacity:0}
+}
 </style>
 </head>
 <body>
 <div class="stage">
   <header>
-    <h1><span class="live"></span>🎤 语音输入</h1>
-    <p class="sub">Web 麦克风 → GPU Whisper 转录 → 光标处即时上屏</p>
+    <div class="ttl">
+      <h1><span class="live"></span>🎤 语音输入</h1>
+      <p class="sub">Web 麦克风 → GPU Whisper 转录 → 光标处即时上屏</p>
+    </div>
+    <button id="corrToggle" type="button" title="LLM 智能纠错(Qwen2.5-0.5B)">✨ 智能纠错 开</button>
   </header>
   <div id="banner" hidden role="alert"></div>
   <div id="status">正在检测环境…</div>
@@ -682,6 +833,12 @@ h1 .live{width:8px;height:8px;border-radius:50%;background:linear-gradient(135de
       <button id="talk" class="big"><em>🎙</em><small>说话</small></button>
     </div>
   </main>
+  <div class="keys" id="keys">
+    <button id="kDel1"  type="button" aria-label="删除1字"><b>⌫</b><small>删1字</small></button>
+    <button id="kDel2"  type="button" aria-label="删除2字"><b>⌫⌫</b><small>删2字</small></button>
+    <button id="kClear" type="button" aria-label="清空输入框"><b>🗑️</b><small>清空</small></button>
+    <button id="kEnter" type="button" aria-label="换行"><b>↵</b><small>换行</small></button>
+  </div>
 </div>
 <script>
 "use strict";
@@ -937,11 +1094,80 @@ $("mHold").onclick = () => setMode("hold");
 bindBig();
 setMode("tap");
 
+/* ---------- 快捷编辑工具栏: 异步按键分发 (精细震动节奏 + 动态涟漪特效) ---------- */
+let lastKeyAt = 0;
+function createRipple(btn, e){
+  const r = document.createElement("span");
+  r.className = "ripple";
+  const rect = btn.getBoundingClientRect();
+  const size = Math.max(rect.width, rect.height);
+  r.style.width = r.style.height = size + "px";
+  const clientX = (e && e.touches && e.touches[0] ? e.touches[0].clientX : (e ? e.clientX : rect.left + rect.width / 2));
+  const clientY = (e && e.touches && e.touches[0] ? e.touches[0].clientY : (e ? e.clientY : rect.top + rect.height / 2));
+  r.style.left = (clientX - rect.left - size / 2) + "px";
+  r.style.top = (clientY - rect.top - size / 2) + "px";
+  btn.appendChild(r);
+  setTimeout(() => { try{ r.remove(); }catch(_){} }, 400);
+}
+
+function keyVibrate(action){
+  if (!navigator.vibrate) return;
+  try {
+    if (action === "backspace1") {
+      navigator.vibrate(28);                      // 删1字: 清脆短震
+    } else if (action === "backspace2") {
+      navigator.vibrate([22, 35, 22]);            // 删2字: 动感双震
+    } else if (action === "clear") {
+      navigator.vibrate([40, 40, 70]);            // 清空: 警示重击感震动
+    } else if (action === "enter") {
+      navigator.vibrate(45);                      // 换行: 沉稳确认中震
+    } else {
+      navigator.vibrate(25);
+    }
+  } catch(_) {}
+}
+
+function keyAction(action, btn, e){
+  const now = Date.now();
+  if (now - lastKeyAt < 160) return;                 // 防误触节流
+  lastKeyAt = now;
+  if (btn) createRipple(btn, e);                     // 扩散高光波纹特效
+  keyVibrate(action);                                // 精准物理震动反馈
+  fetch("/key?k=" + encodeURIComponent(action), { cache: "no-store" })
+    .then(r => r.json())
+    .then(j => { if (!j.ok) setStatus("按键被服务器拒绝: " + j.action); })
+    .catch(() => setStatus("按键请求失败"));
+}
+
+$("kDel1").onpointerdown  = (e) => { e.preventDefault(); keyAction("backspace1", $("kDel1"), e); };
+$("kDel2").onpointerdown  = (e) => { e.preventDefault(); keyAction("backspace2", $("kDel2"), e); };
+$("kClear").onpointerdown = (e) => { e.preventDefault(); keyAction("clear", $("kClear"), e); };
+$("kEnter").onpointerdown = (e) => { e.preventDefault(); keyAction("enter", $("kEnter"), e); };
+
+/* ---------- LLM 智能纠错开关 (与后端 ENABLE_LLM_CORRECT 同步) ---------- */
+let llmCorrect = true;
+function updateCorrUI(){
+  const on = !!llmCorrect;
+  $("corrToggle").classList.toggle("off", !on);
+  $("corrToggle").textContent = "✨ 智能纠错 " + (on ? "开" : "关");
+}
+$("corrToggle").onclick = () => {
+  buzz();
+  llmCorrect = !llmCorrect;
+  updateCorrUI();
+  fetch("/corrector?on=" + (llmCorrect ? 1 : 0), { cache: "no-store" })
+    .then(r => r.json())
+    .then(j => { llmCorrect = !!j.llm_correct; updateCorrUI(); })
+    .catch(() => {});
+};
+updateCorrUI();
+
 async function pollStatus(){
   try {
     const r = await fetch("/status", { cache: "no-store" });
     const j = await r.json();
     setStatus("服务器状态: " + j.state + (j.state === "RECORDING" ? " · 已收 " + j.audio_bytes + " B" : ""));
+    if (j.llm_correct !== undefined){ llmCorrect = !!j.llm_correct; updateCorrUI(); }
   } catch (_) { setStatus("服务器离线"); }
 }
 setInterval(pollStatus, 2000);
@@ -988,6 +1214,35 @@ class Handler(BaseHTTPRequestHandler):
         self._headers(302, "text/plain; charset=utf-8", 0,
                       extra={"Location": location})
 
+    def _read_body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            return self.rfile.read(length) if length else b""
+        except Exception:
+            return b""
+
+    def _do_key(self):
+        k = _key_from_request_path(self.path, self._read_body())
+        ok, msg = dispatch_key(k)
+        self._json({"ok": ok, "action": msg}, 200 if ok else 400)
+
+    def _do_corrector(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        on = (qs.get("on") or [""])[0]
+        if not on:
+            body = self._read_body()
+            if body:
+                try:
+                    on = str(json.loads(body).get("on", ""))
+                except Exception:
+                    pass
+        if on in ("1", "true", "on"):
+            set_corrector_enabled(True)
+        elif on in ("0", "false", "off"):
+            set_corrector_enabled(False)
+        self._json({"ok": True,
+                    "llm_correct": bool(CORRECTOR is not None and CORRECTOR.enabled)})
+
     def do_GET(self):
         mode = getattr(self.server, "mode", "api")
         path = self.path.split("?", 1)[0]
@@ -1003,10 +1258,34 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(status_payload())
                 elif path == "/healthz":
                     self._text("ok")
+                elif path in ("/key", "/api/key"):
+                    self._do_key()
+                elif path == "/corrector":
+                    self._do_corrector()
                 elif path == "/":
-                    self._text("whisper-all-in-one control API: /toggle /status /healthz")
+                    self._text("whisper-all-in-one control API: /toggle /status /healthz /key /corrector")
                 else:
                     self._text("not found", 404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            try:
+                self._json({"error": str(e)}, 500)
+            except Exception:
+                pass
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        try:
+            if path in ("/key", "/api/key"):
+                self._do_key()
+            elif path == "/corrector":
+                self._do_corrector()
+            elif path == "/toggle":
+                toggle_record()
+                self._json(status_payload())
+            else:
+                self._text("not found", 404)
         except BrokenPipeError:
             pass
         except Exception as e:
